@@ -10,6 +10,7 @@ pub mod cli;
 pub mod logging;
 pub mod mime;
 pub mod payload;
+pub mod sandbox;
 pub mod transfer;
 pub mod wayland;
 pub mod x11;

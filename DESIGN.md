@@ -192,7 +192,7 @@ The systemd hardening in §9 only applies when clipferry runs under the unit. La
 1. Parse args, resolve `$WAYLAND_DISPLAY` / `$DISPLAY`.
 2. Establish both connections (including the X11 startup retry loop — Xauthority is read here).
 3. Apply one ruleset and enforce:
-   - **Filesystem:** handle all fs access rights, add **zero rules** → all fs access denied. stderr/stdout and the two display sockets are already-open fds and keep working. There is no config file (§3 non-goals) and no cache, so nothing is lost — after the lock, the process legitimately needs zero filesystem access for its whole life.
+   - **Filesystem:** handle all fs access rights, add **one rule** — read-only access to the Xauthority file (`$XAUTHORITY` / `~/.Xauthority`) → everything else denied. stderr/stdout and the two display sockets are already-open fds and keep working. The single exception exists because transfers run on per-transfer X11 connections (§4.4/§6) that re-authenticate after the lock; a read-only auth cookie is not an exfiltration vector, and no write access exists anywhere. There is no config file (§3 non-goals) and no cache.
    - **Network:** handle `bind_tcp` + `connect_tcp`, add zero rules → all TCP denied (ABI v4, kernel ≥ 6.7). Unix sockets are unaffected — exactly right for us.
 4. Log the achieved ABI level once at INFO (e.g. `landlock: enforced (ABI v4, fs+tcp)` / `landlock: unavailable, relying on systemd hardening`).
 
