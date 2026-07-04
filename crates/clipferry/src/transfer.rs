@@ -463,10 +463,23 @@ fn serve_x2w(request: X2wRequest) -> anyhow::Result<()> {
         SelKind::Clipboard => atoms.CLIPBOARD,
         SelKind::Primary => Atom::from(AtomEnum::PRIMARY),
     };
+    // Watch the owner window: if it dies mid-transfer we must abort rather
+    // than wait forever for INCR chunks — a hung reader would hold the
+    // X→W gate and kill the whole direction.
+    let owner = conn.get_selection_owner(selection)?.reply()?.owner;
+    if owner != x11rb::NONE {
+        // Best-effort: the owner may already be gone.
+        let _ = conn
+            .change_window_attributes(
+                owner,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            )
+            .map(x11rb::cookie::VoidCookie::check);
+    }
     for (target, conversion, transform) in candidates {
         conn.convert_selection(win, selection, target, atoms.CLIPFERRY, x11rb::CURRENT_TIME)?;
         conn.flush()?;
-        match wait_selection_notify(&conn, win)? {
+        match wait_selection_notify(&conn, win, owner)? {
             Some(property) if property != x11rb::NONE => {
                 let mut sink = Sink {
                     out: &mut out,
@@ -474,7 +487,7 @@ fn serve_x2w(request: X2wRequest) -> anyhow::Result<()> {
                     strip_pending: transform == Transform::StripCopyHeader,
                     total: 0,
                 };
-                return stream_x11_property(&conn, win, &atoms, timeout, &mut sink);
+                return stream_x11_property(&conn, win, owner, &atoms, timeout, &mut sink);
             }
             _ => {} // owner refused this target — try the next candidate
         }
@@ -483,14 +496,22 @@ fn serve_x2w(request: X2wRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn wait_selection_notify(conn: &RustConnection, win: Window) -> anyhow::Result<Option<Atom>> {
+fn wait_selection_notify(
+    conn: &RustConnection,
+    win: Window,
+    owner: Window,
+) -> anyhow::Result<Option<Atom>> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
         if let Some(event) = conn.poll_for_event()? {
-            if let Event::SelectionNotify(e) = event
-                && e.requestor == win
-            {
-                return Ok(Some(e.property));
+            match event {
+                Event::SelectionNotify(e) if e.requestor == win => {
+                    return Ok(Some(e.property));
+                }
+                Event::DestroyNotify(e) if e.window == owner && owner != x11rb::NONE => {
+                    bail!("X11 owner window destroyed before answering");
+                }
+                _ => {}
             }
         } else if Instant::now() > deadline {
             bail!("X11 owner did not answer ConvertSelection within {HANDSHAKE_TIMEOUT:?}");
@@ -539,6 +560,7 @@ impl Sink<'_> {
 fn stream_x11_property(
     conn: &RustConnection,
     win: Window,
+    owner: Window,
     atoms: &Atoms,
     timeout: Option<Duration>,
     sink: &mut Sink<'_>,
@@ -548,7 +570,7 @@ fn stream_x11_property(
         .reply()
         .context("probe property type")?;
     if head.type_ == atoms.INCR {
-        return stream_x11_incr(conn, win, atoms, timeout, sink);
+        return stream_x11_incr(conn, win, owner, atoms, timeout, sink);
     }
 
     let mut offset_units = 0_u32;
@@ -583,6 +605,7 @@ fn stream_x11_property(
 fn stream_x11_incr(
     conn: &RustConnection,
     win: Window,
+    owner: Window,
     atoms: &Atoms,
     timeout: Option<Duration>,
     sink: &mut Sink<'_>,
@@ -591,7 +614,7 @@ fn stream_x11_incr(
     conn.flush()?;
     let mut writer_gone: Option<std::io::Error> = None;
     loop {
-        wait_property_new_value(conn, win, atoms.CLIPFERRY, timeout)?;
+        wait_property_new_value(conn, win, owner, atoms.CLIPFERRY, timeout)?;
         let reply = conn
             .get_property(true, win, atoms.CLIPFERRY, AtomEnum::ANY, 0, u32::MAX / 4)?
             .reply()
@@ -626,18 +649,23 @@ fn stream_x11_incr(
 fn wait_property_new_value(
     conn: &RustConnection,
     win: Window,
+    owner: Window,
     prop: Atom,
     timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
         if let Some(event) = conn.poll_for_event()? {
-            if let Event::PropertyNotify(e) = event
-                && e.window == win
-                && e.atom == prop
-                && e.state == Property::NEW_VALUE
-            {
-                return Ok(());
+            match event {
+                Event::PropertyNotify(e)
+                    if e.window == win && e.atom == prop && e.state == Property::NEW_VALUE =>
+                {
+                    return Ok(());
+                }
+                Event::DestroyNotify(e) if e.window == owner && owner != x11rb::NONE => {
+                    bail!("X11 owner window destroyed mid-INCR transfer");
+                }
+                _ => {}
             }
         } else if deadline.is_some_and(|d| Instant::now() > d) {
             bail!("transfer idle timeout waiting for INCR chunk");
