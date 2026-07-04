@@ -22,7 +22,7 @@ pub fn disable_dumps() {
     if let Err(e) =
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
     {
-        warn!("PR_SET_DUMPABLE=0 failed: {e}");
+        warn!("event=sandbox dumpable=error error={:?}", e.to_string());
     }
 }
 
@@ -62,20 +62,18 @@ pub fn apply() -> anyhow::Result<RulesetStatus> {
 
 pub fn apply_and_log(disabled: bool) {
     if disabled {
-        warn!("landlock: DISABLED by --no-landlock — running without the in-process sandbox");
+        warn!("event=sandbox landlock=disabled reason=no-landlock-flag");
         return;
     }
     match apply() {
-        Ok(RulesetStatus::FullyEnforced) => info!("landlock: enforced (fs+tcp)"),
+        Ok(RulesetStatus::FullyEnforced) => info!("event=sandbox landlock=enforced scope=fs+tcp"),
         Ok(RulesetStatus::PartiallyEnforced) => {
-            info!(
-                "landlock: partially enforced (older kernel ABI); systemd hardening still applies"
-            );
+            info!("event=sandbox landlock=partial reason=older-kernel-abi");
         }
         Ok(RulesetStatus::NotEnforced) => {
-            info!("landlock: unavailable, relying on systemd hardening");
+            info!("event=sandbox landlock=unavailable");
         }
-        Err(e) => warn!("landlock: failed to apply ({e:#}); relying on systemd hardening"),
+        Err(e) => warn!("event=sandbox landlock=error error={:?}", format!("{e:#}")),
     }
 }
 

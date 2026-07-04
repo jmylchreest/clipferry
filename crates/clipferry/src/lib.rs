@@ -40,6 +40,15 @@ impl SelKind {
             Self::Primary => "PRIMARY",
         }
     }
+
+    /// logfmt field value (`sel=`).
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Clipboard => "clipboard",
+            Self::Primary => "primary",
+        }
+    }
 }
 
 pub const NAME: &str = env!("CARGO_PKG_NAME");

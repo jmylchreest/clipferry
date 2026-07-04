@@ -147,16 +147,19 @@ impl App {
             self.ctx[kind.idx()].sensitive = sensitive;
             if sensitive {
                 if self.skip_sensitive {
-                    info!("[sensitive] Wayland offer skipped (--skip-sensitive)");
+                    info!(
+                        "event=skip side=wayland sel={} reason=sensitive",
+                        kind.key()
+                    );
                     offer.destroy();
                     self.dispatch_broker(kind, broker::Event::WaylandCleared);
                     return;
                 }
-                info!("[sensitive] Wayland selection changed on {}", kind.label());
+                info!("event=offer side=wayland sel={} sensitive=true", kind.key());
             } else {
                 debug!(
-                    "wayland {} changed: {} MIME types offered",
-                    kind.label(),
+                    "event=offer side=wayland sel={} mimes={}",
+                    kind.key(),
                     mime_types.len()
                 );
             }
@@ -167,7 +170,7 @@ impl App {
                 .filter(|m| !mime::PROTOCOL_TARGETS.contains(&m.as_str()))
                 .collect();
             let event = if bridgeable.is_empty() {
-                debug!("offer has no bridgeable types; standing down");
+                debug!("event=offer side=wayland sel={} bridgeable=0", kind.key());
                 broker::Event::WaylandCleared
             } else {
                 broker::Event::WaylandSelection {
@@ -177,11 +180,11 @@ impl App {
             self.dispatch_broker(kind, event);
         } else if self.survives_source_exit(kind, false) {
             debug!(
-                "Wayland source exited; serving {} from eager snapshot",
-                kind.label()
+                "event=snapshot_serve side=wayland sel={} reason=source-exited",
+                kind.key()
             );
         } else {
-            debug!("wayland {} cleared", kind.label());
+            debug!("event=clear side=wayland sel={}", kind.key());
             self.ctx[kind.idx()].sensitive = false;
             self.dispatch_broker(kind, broker::Event::WaylandCleared);
         }
@@ -208,7 +211,7 @@ impl App {
             .as_ref()
             .is_some_and(|s| s.id() == source.id());
         if !is_current {
-            debug!("send request on a superseded source; dropping (empty paste)");
+            debug!("event=refuse dir=x2w reason=superseded-source");
             return; // dropping fd closes the pipe → empty paste
         }
         // Over-cap types miss the snapshot and degrade to lazy (§4.2.1).
@@ -253,10 +256,7 @@ impl App {
             }
             match self.x11.selection_owner(kind) {
                 Ok(owner) if owner != x11rb::NONE && owner != self.x11.win => {
-                    info!(
-                        "startup: X11 {} has an owner; filling the Wayland side",
-                        kind.label()
-                    );
+                    info!("event=startup_fill side=x11 sel={}", kind.key());
                     self.dispatch_broker(kind, broker::Event::X11Selection);
                 }
                 Ok(_) => {}
@@ -298,7 +298,7 @@ impl App {
                 if has_owner {
                     self.dispatch_broker(SelKind::Primary, broker::Event::X11Selection);
                 } else if self.survives_source_exit(SelKind::Primary, true) {
-                    debug!("X11 source exited; serving PRIMARY from eager snapshot");
+                    debug!("event=snapshot_serve side=x11 sel=primary reason=source-exited");
                 } else {
                     self.dispatch_broker(SelKind::Primary, broker::Event::X11Cleared);
                 }
@@ -348,7 +348,7 @@ impl App {
         match event {
             Event::SelectionClear(e) => {
                 if let Some(kind) = self.kind_for_selection(e.selection) {
-                    info!("lost X11 {} to a real X11 client", kind.label());
+                    info!("event=lost side=x11 sel={}", kind.key());
                     self.x11.owned_since[kind.idx()] = None;
                     self.dispatch_broker(kind, broker::Event::X11Lost);
                 }
@@ -369,12 +369,18 @@ impl App {
                     return;
                 }
                 if has_owner {
-                    debug!("X11 {} claimed by 0x{:x}", kind.label(), e.owner);
+                    let class = self.x11.owner_class(e.owner);
+                    info!(
+                        "event=owner side=x11 sel={} owner=0x{:x} class={:?}",
+                        kind.key(),
+                        e.owner,
+                        class.as_deref().unwrap_or("unknown")
+                    );
                     self.dispatch_broker(kind, broker::Event::X11Selection);
                 } else if self.survives_source_exit(kind, true) {
                     debug!(
-                        "X11 source exited; serving {} from eager snapshot",
-                        kind.label()
+                        "event=snapshot_serve side=x11 sel={} reason=source-exited",
+                        kind.key()
                     );
                 } else {
                     self.dispatch_broker(kind, broker::Event::X11Cleared);
@@ -406,7 +412,7 @@ impl App {
                     self.ctx[kind.idx()].sensitive = sensitive;
                     if sensitive {
                         if self.skip_sensitive {
-                            info!("[sensitive] X11 offer skipped (--skip-sensitive)");
+                            info!("event=skip side=x11 sel={} reason=sensitive", kind.key());
                             self.dispatch_broker(
                                 kind,
                                 broker::Event::X11Targets {
@@ -416,7 +422,7 @@ impl App {
                             );
                             return;
                         }
-                        info!("[sensitive] X11 selection changed on {}", kind.label());
+                        info!("event=offer side=x11 sel={} sensitive=true", kind.key());
                     }
                     let (advertised, plans) = mime::x2w_translate(&names);
                     self.ctx[kind.idx()].x2w_plans = plans
@@ -425,7 +431,11 @@ impl App {
                         .collect();
                     mime_types = advertised;
                 }
-                Err(err) => debug!("reading TARGETS reply failed: {err:#}"),
+                Err(err) => debug!(
+                    "event=targets sel={} error={:?}",
+                    kind.key(),
+                    format!("{err:#}")
+                ),
             }
         }
         self.dispatch_broker(kind, broker::Event::X11Targets { epoch, mime_types });
@@ -467,7 +477,7 @@ impl App {
         } else if req.target == atoms.MULTIPLE {
             // §6: refuse, but log at INFO so we find out if a real app needs it.
             info!(
-                "MULTIPLE requested by 0x{:x} — unsupported for now",
+                "event=refuse target=MULTIPLE requestor=0x{:x}",
                 req.requestor
             );
             transfer::notify(&self.x11.conn, &req, None);
@@ -505,7 +515,7 @@ impl App {
             // §7 pass-through / synthesized targets.
             self.start_paste(kind, req, property, mime, req.target, Conv::None, transform);
         } else {
-            debug!("refusing unadvertised target atom {}", req.target);
+            debug!("event=refuse target={} reason=unadvertised", req.target);
             transfer::notify(&self.x11.conn, &req, None);
         }
         if let Err(e) = self.x11.conn.flush() {
@@ -547,6 +557,8 @@ impl App {
         transform: Transform,
     ) {
         let reply = PasteReply {
+            kind,
+            mime: mime.clone(),
             req,
             property,
             reply_type,
@@ -568,7 +580,7 @@ impl App {
         let (reader, writer) = match std::io::pipe() {
             Ok(pair) => pair,
             Err(e) => {
-                error!("pipe() for paste transfer failed: {e}");
+                error!("event=paste error={:?}", e.to_string());
                 transfer::notify(&self.x11.conn, &req, None);
                 return;
             }
@@ -613,7 +625,7 @@ impl App {
                             drop(writer);
                             pipes.push((mime.clone(), reader));
                         }
-                        Err(e) => error!("pipe() for eager fetch failed: {e}"),
+                        Err(e) => error!("event=snapshot error={:?}", e.to_string()),
                     }
                 }
                 if let Err(e) = self.wl_conn.flush() {
@@ -641,7 +653,7 @@ impl App {
                             });
                             pipes.push((mime.clone(), reader));
                         }
-                        Err(e) => error!("pipe() for eager fetch failed: {e}"),
+                        Err(e) => error!("event=snapshot error={:?}", e.to_string()),
                     }
                 }
                 std::thread::spawn(move || {
@@ -659,14 +671,14 @@ impl App {
             return; // superseded claim; ropes zero on drop
         }
         if !msg.snapshot.lock_in_memory() {
-            debug!("eager snapshot partially mlocked (RLIMIT_MEMLOCK); continuing");
+            debug!("event=mlock status=partial");
         }
         let types = msg.snapshot.data.len();
         ctx.snapshot = Some(Arc::new(msg.snapshot));
         if ctx.sensitive {
-            info!("[sensitive] eager snapshot ready");
+            info!("event=snapshot sel={} sensitive=true", msg.kind.key());
         } else {
-            debug!("eager snapshot ready: {types} types");
+            debug!("event=snapshot sel={} types={types}", msg.kind.key());
         }
     }
 
@@ -757,11 +769,14 @@ impl App {
                 } else {
                     if self.ctx[kind.idx()].sensitive {
                         info!(
-                            "[sensitive] claimed Wayland {} (proxying X11)",
-                            kind.label()
+                            "event=claim side=wayland sel={} reason=proxy-x11 sensitive=true",
+                            kind.key()
                         );
                     } else {
-                        info!("claimed Wayland {} (proxying X11 owner)", kind.label());
+                        info!(
+                            "event=claim side=wayland sel={} reason=proxy-x11",
+                            kind.key()
+                        );
                     }
                     let mimes = mime_types.clone();
                     self.start_eager_fetch(kind, &mimes);
@@ -774,7 +789,7 @@ impl App {
                     if let Err(e) = self.wl_conn.flush() {
                         self.fatal(anyhow!(e).context("flush Wayland after release"));
                     } else {
-                        info!("released Wayland {}", kind.label());
+                        info!("event=release side=wayland sel={}", kind.key());
                     }
                 }
             }
@@ -782,7 +797,7 @@ impl App {
     }
 
     pub fn fatal(&mut self, error: anyhow::Error) {
-        error!("fatal: {error:#}");
+        error!("event=fatal error={:?}", format!("{error:#}"));
         if self.exit.is_none() {
             self.exit = Some(error);
         }
@@ -812,9 +827,16 @@ fn collect_snapshot(
                 }
             }
             Ok(ReadOutcome::Overflow(_)) => {
-                debug!("eager: {mime} exceeds --eager-max-size; degrading to lazy");
+                debug!(
+                    "event=snapshot_skip sel={} mime={mime:?} reason=over-cap",
+                    kind.key()
+                );
             }
-            Err(e) => debug!("eager fetch of {mime} failed: {e}"),
+            Err(e) => debug!(
+                "event=snapshot_skip sel={} mime={mime:?} error={:?}",
+                kind.key(),
+                e.to_string()
+            ),
         }
     }
     let _ = tx.send(SnapshotMsg {
