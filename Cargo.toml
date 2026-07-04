@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/clipferry"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/jmylchreest/clipferry"
+authors = ["John Mylchreest <jmylchreest@gmail.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Selective allows: pedantic lints whose noise outweighs their signal here.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Restriction cherry-picks (never enable the group wholesale).
+unwrap_used = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Size budget from DESIGN.md §11: target ≈1–1.5 MiB stripped.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

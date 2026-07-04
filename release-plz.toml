@@ -1,0 +1,8 @@
+# Pre-implementation settings: release-plz maintains the version + changelog PR
+# only. Flip publish/git_release/git_tag to true at M5 (crates.io + first tag).
+[workspace]
+publish = false
+git_release_enable = false
+git_tag_enable = false
+changelog_update = true
+release_always = false

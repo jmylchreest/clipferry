@@ -1,0 +1,52 @@
+# Continuous snapshot release from main: every push replaces the `snapshot`
+# prerelease with a build versioned {crate}-dev.{commit-count}+g{sha} —
+# monotonic, sortable, traceable to a commit.
+name: Snapshot
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    name: snapshot release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Compute snapshot version
+        run: |
+          base=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="clipferry") | .version')
+          echo "VERSION=${base}-dev.$(git rev-list --count HEAD)+g$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          staging="clipferry-${VERSION}-x86_64-linux"
+          mkdir "$staging"
+          cp target/release/clipferry contrib/clipferry.service LICENSE README.md CHANGELOG.md "$staging"/
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+      - name: Publish snapshot release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete snapshot --yes --cleanup-tag || true
+          gh release create snapshot \
+            --prerelease --latest=false \
+            --title "snapshot ${VERSION}" \
+            --notes "Continuous snapshot build from \`main\` at ${GITHUB_SHA}." \
+            clipferry-*.tar.gz clipferry-*.tar.gz.sha256

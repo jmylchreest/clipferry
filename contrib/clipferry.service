@@ -1,0 +1,22 @@
+[Unit]
+Description=clipferry — X11 <-> Wayland clipboard bridge
+After=graphical-session.target
+PartOf=graphical-session.target
+# Only needed on satellite-style compositors; gate per-session with a user
+# drop-in (~/.config/systemd/user/clipferry.service.d/*.conf), e.g.:
+#   ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/clipferry
+Restart=always
+RestartSec=1
+# Hardening — the daemon needs only the two display sockets and stderr:
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=graphical-session.target
