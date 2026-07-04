@@ -21,6 +21,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # tags needed for the workflow_dispatch fallback
       - name: Pin PKGBUILD to the released version
         env:
           TAG: ${{ github.event.release.tag_name }}
