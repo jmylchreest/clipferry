@@ -28,17 +28,25 @@ impl Log for StderrLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        let level = match record.level() {
+            Level::Error => "error",
+            Level::Warn => "warn",
+            Level::Info => "info",
+            Level::Debug => "debug",
+            Level::Trace => "trace",
+        };
         if JOURNAL.load(Ordering::Relaxed) {
-            // sd-daemon(3) priority prefixes.
+            // sd-daemon(3) priority prefix (journald metadata) + level= as a
+            // logfmt field so `-o cat` output stays self-contained.
             let priority = match record.level() {
                 Level::Error => 3,
                 Level::Warn => 4,
                 Level::Info => 6,
                 Level::Debug | Level::Trace => 7,
             };
-            eprintln!("<{priority}>{}", record.args());
+            eprintln!("<{priority}>level={level} {}", record.args());
         } else {
-            eprintln!("{:5} {}", record.level(), record.args());
+            eprintln!("level={level} {}", record.args());
         }
     }
 
