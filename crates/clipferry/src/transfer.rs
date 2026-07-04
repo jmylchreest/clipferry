@@ -170,13 +170,23 @@ fn serve_w2x(
                 }
                 Conv::Latin1ToUtf8 => latin1_to_utf8(&data),
             };
-            let data = if reply.transform == Transform::PrependCopyHeader {
-                let mut with_header = Zeroizing::new(Vec::with_capacity(data.len() + 5));
-                with_header.extend_from_slice(b"copy\n");
-                with_header.extend_from_slice(&data);
-                with_header
-            } else {
-                data
+            let data = match reply.transform {
+                Transform::None => data,
+                Transform::PrependCopyHeader => {
+                    let mut with_header = Zeroizing::new(Vec::with_capacity(data.len() + 5));
+                    with_header.extend_from_slice(b"copy\n");
+                    with_header.extend_from_slice(&data);
+                    with_header
+                }
+                Transform::StripCopyHeader => {
+                    let start = data
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(data.len(), |nl| nl + 1);
+                    let mut stripped = Zeroizing::new(Vec::with_capacity(data.len() - start));
+                    stripped.extend_from_slice(&data[start..]);
+                    stripped
+                }
             };
             conn.change_property8(
                 PropMode::REPLACE,
@@ -191,9 +201,10 @@ fn serve_w2x(
             debug!("served X11 paste: {} bytes", data.len());
         }
         ReadOutcome::Overflow(head) => {
-            if reply.conversion != Conv::None {
-                // Charset conversion needs the whole payload; nobody pastes
-                // multi-megabyte content into a STRING-only client.
+            if reply.conversion != Conv::None || reply.transform == Transform::StripCopyHeader {
+                // Charset conversion and header stripping need the whole
+                // payload; neither occurs on multi-megabyte content (text
+                // into STRING clients, file lists) in practice.
                 warn!("payload too large for charset conversion; refusing");
                 notify(conn, &reply.req, None);
                 conn.flush()?;
