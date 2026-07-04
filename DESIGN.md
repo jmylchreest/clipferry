@@ -279,3 +279,29 @@ cliphist / wl-clip-persist / clipse also use data-control on the same compositor
 ## 15. Name
 
 **clipferry** — verified available 2026-07-04: crates.io (404), AUR (0 packages), GitHub (0 repos with that name). The metaphor is exact: a ferry carries cargo between two shores on demand; it doesn't warehouse it.
+
+## 10.1 Field finding (2026-07-04): Xwayland's builtin bridge on xwayland-satellite 0.8.1
+
+Live observation on niri + xwayland-satellite 0.8.1 (Xwayland ≥ 24.1): the
+builtin selection bridge (§2, issue #433) is **active but focus-dependent** —
+Xwayland can only set the Wayland selection while one of its windows holds
+input focus (it needs a recent serial). Consequences observed:
+
+- With X11 focus: satellite bridges both directions itself (text-subset).
+  clipferry's claims are mirrored back by Xwayland as Wayland offers whose
+  MIME list contains literal `TARGETS`/`TIMESTAMP` (naive target mirroring);
+  the mirror's takeover **cancels the real Wayland source**, so clipferry's
+  lazy proxy then serves a dead offer. Bridge-vs-bridge does not converge:
+  §10's argument assumes the other claimant is a real client on exactly one
+  side, which a second bridge is not.
+- Without X11 focus: the builtin X→W half cannot act — the historic "copy
+  from X11 app never reaches Wayland" gap this project exists for.
+
+Open design question: coexistence with the builtin bridge. Candidate rules,
+none yet validated end-to-end: mirror-offer detection (protocol atoms in a
+Wayland MIME list) must be paired with eager receive-before-claim, or the
+mirror's source-kill leaves nothing to serve; a dormant mode that only fills
+the no-X-focus gap; or requiring satellite ≥ 0.9 / builtin-bridge-disabled
+setups. Until resolved, clipferry and satellite 0.8.1's builtin bridge
+should not run against the same session; the experiments live on the
+`feat/satellite-coexistence` branch.
