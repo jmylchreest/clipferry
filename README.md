@@ -6,7 +6,26 @@
 [![Snapshot](https://img.shields.io/github/v/release/jmylchreest/clipferry?include_prereleases&label=snapshot)](https://github.com/jmylchreest/clipferry/releases/tag/snapshot)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: functional, pre-1.0.** All five design milestones are implemented and live-tested on niri + xwayland-satellite; snapshot builds are usable today (see [Install](#install)).
+> **Status: functional, pre-1.0.** All five design milestones are implemented and live-tested on niri + xwayland-satellite; snapshot builds are usable today.
+
+## Quickstart
+
+```sh
+# Arch: build + install from the bundled PKGBUILD (AUR packages land with v0.0.1)
+git clone https://github.com/jmylchreest/clipferry
+cd clipferry/contrib/aur/clipferry-git && makepkg -si
+
+# any distro
+cargo install --git https://github.com/jmylchreest/clipferry
+sudo cp contrib/clipferry.service /usr/lib/systemd/user/   # or ~/.config/systemd/user/
+
+# then, either way:
+systemctl --user enable --now clipferry.service
+clipferry --oneshot-check                  # sanity: both displays reachable?
+journalctl --user -u clipferry -f          # watch it work (k=v event log)
+```
+
+No configuration, no config file — a bare `clipferry` does the right thing. Flags below tune behaviour.
 
 ## Why
 
@@ -44,6 +63,22 @@ systemctl --user enable --now clipferry.service
 That's it — no config file, ever. A bare `clipferry` invocation with the standard `$DISPLAY`/`$WAYLAND_DISPLAY` environment is the recommended setup; behaviour tweaks are CLI flags (`--sync-mode eager`, `--primary`, `--skip-sensitive`, …).
 
 Continuous builds from `main` are published to the [snapshot release](https://github.com/jmylchreest/clipferry/releases/tag/snapshot).
+
+## Flags
+
+Every flag is safe to omit; the defaults are the recommended setup.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--sync-mode lazy\|eager` | `lazy` | `lazy`: payload bytes move only when someone pastes. `eager`: snapshot each copy immediately so content survives the source app exiting (recommended alongside heavy clipboard tooling). |
+| `--eager-max-size SIZE` | `10M` | Per-type eager snapshot cap (`512K`, `1G`, `0`/`unlimited`). Over-cap types degrade to lazy for that copy. |
+| `--primary` | off | Also bridge the PRIMARY (middle-click) selection, with 50 ms debounce. |
+| `--skip-sensitive` | off | Don't bridge offers carrying `x-kde-passwordManagerHint` (password managers). Without it they bridge, logged as `sensitive=true` with no type details. |
+| `--transfer-timeout SECS` | `0` (none) | *Idle* timeout for in-flight transfers — fires on stalled progress, never on total duration. Independently, the first byte of any transfer is always bounded at 2 s: silence is never forwarded to a waiting application. |
+| `--aggressive-claims` | off | Claim selections immediately instead of **backstop mode** (see [Coexistence](#coexistence)), and re-claim when another *bridge* takes our claim — never from a real application. For bridgeless rootless-Xwayland setups. |
+| `--no-landlock` | off | Disable the self-applied Landlock sandbox (debugging only; logged loudly). |
+| `--oneshot-check` | — | Connect to both displays, print protocols/versions, exit. Support triage. |
+| `--log-level LEVEL` | `info` | `error`–`trace`. Logfmt `k=v` output; under systemd, lines carry real journald priorities (`journalctl -p warning` works). Content is never logged at any level. |
 
 ## Roadmap
 

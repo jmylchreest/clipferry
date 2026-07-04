@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Backstop mode (default): claims land only in voids — after a copy,
+  the other side gets 200 ms to be bridged by anything else before
+  clipferry fills the gap; causality pairing prevents re-bridging
+  another bridge's answer. Coexists with xwayland-satellite ≥ 0.8's
+  builtin sync without ownership fights. `--aggressive-claims` opts
+  into immediate claiming with bridge-only re-claims.
+- Structured logfmt logging (`level= event= sel= mime= bytes= …`) with
+  real journald priorities via validated sd-daemon prefixes; X11 owners
+  identified by `WM_CLASS` where available.
+
 - M5: self-applied Landlock sandbox (fs deny-all + read-only Xauthority,
   TCP deny; BestEffort), PR_SET_DUMPABLE=0, `--no-landlock`, hidden
   `--sandbox-selftest` (CI-tested), AUR PKGBUILDs, git tags + GitHub
@@ -27,3 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   X11 selection ownership with TARGETS/TIMESTAMP, per-paste transfer threads,
   zeroizing chunk-rope payload buffers, `--oneshot-check` diagnostic.
 - Project scaffold: design document, CI pipeline, packaging skeleton.
+
+### Fixed
+
+- Zero-progress waits are bounded at 2 s everywhere (first byte +
+  protocol handshakes): an unanswered X11 conversion can no longer
+  hang synchronous requestors such as Wine/Proton clipboard reads.
+- X→W transfers abort when the owner window is destroyed mid-INCR
+  instead of pinning the transfer gate.
+- `x-special/gnome-copied-files`-only Wayland offers synthesize
+  `text/uri-list` for X11 (cut/copy header handled both directions).
