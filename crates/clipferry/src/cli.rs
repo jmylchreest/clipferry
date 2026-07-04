@@ -7,6 +7,8 @@ use log::LevelFilter;
 pub struct Options {
     pub oneshot_check: bool,
     pub log_level: LevelFilter,
+    /// §4.2 idle timeout in seconds; 0 (default) = no timeout.
+    pub transfer_timeout: u64,
 }
 
 pub enum Parsed {
@@ -21,8 +23,9 @@ clipferry — X11 <-> Wayland clipboard bridge
 Usage: clipferry [OPTIONS]
 
 Options:
-      --oneshot-check      Connect to both displays, print a diagnostic, exit
-      --log-level LEVEL    error|warn|info|debug|trace  [default: info]
+      --oneshot-check          Connect to both displays, print a diagnostic, exit
+      --log-level LEVEL        error|warn|info|debug|trace  [default: info]
+      --transfer-timeout SECS  Idle timeout for payload transfers; 0 = none  [default: 0]
   -V, --version            Print version
   -h, --help               Print this help
 ";
@@ -38,10 +41,14 @@ fn parse_from(mut parser: lexopt::Parser) -> anyhow::Result<Parsed> {
     let mut options = Options {
         oneshot_check: false,
         log_level: LevelFilter::Info,
+        transfer_timeout: 0,
     };
     while let Some(arg) = parser.next()? {
         match arg {
             Long("oneshot-check") => options.oneshot_check = true,
+            Long("transfer-timeout") => {
+                options.transfer_timeout = parser.value()?.parse()?;
+            }
             Long("log-level") => {
                 let value = parser.value()?;
                 let Some(text) = value.to_str() else {
@@ -91,11 +98,27 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let Parsed::Run(o) = run(&["--oneshot-check", "--log-level", "debug"]).unwrap() else {
+        let Parsed::Run(o) = run(&[
+            "--oneshot-check",
+            "--log-level",
+            "debug",
+            "--transfer-timeout",
+            "30",
+        ])
+        .unwrap() else {
             panic!("expected Run")
         };
         assert!(o.oneshot_check);
         assert_eq!(o.log_level, LevelFilter::Debug);
+        assert_eq!(o.transfer_timeout, 30);
+    }
+
+    #[test]
+    fn timeout_defaults_to_infinite() {
+        let Parsed::Run(o) = run(&[]).unwrap() else {
+            panic!("expected Run")
+        };
+        assert_eq!(o.transfer_timeout, 0);
     }
 
     #[test]
