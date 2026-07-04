@@ -57,10 +57,7 @@ pub fn notify(conn: &RustConnection, req: &SelectionRequestEvent, property: Opti
         .send_event(false, req.requestor, EventMask::NO_EVENT, event)
         .map(x11rb::cookie::VoidCookie::check);
     if !matches!(sent, Ok(Ok(()))) {
-        debug!(
-            "requestor 0x{:x} vanished before SelectionNotify",
-            req.requestor
-        );
+        debug!("event=notify_failed requestor=0x{:x}", req.requestor);
     }
 }
 
@@ -100,6 +97,9 @@ impl Read for IdleReader {
 // --- W→X: serve an X11 paste from the Wayland owner ------------------------
 
 pub struct PasteReply {
+    pub kind: crate::SelKind,
+    /// The source MIME being served (logging metadata only).
+    pub mime: String,
     pub req: SelectionRequestEvent,
     pub property: Atom,
     pub reply_type: Atom,
@@ -125,7 +125,7 @@ pub fn spawn_wayland_read(reply: PasteReply, src: PipeReader) {
 /// of touching the (possibly gone) source app.
 pub fn spawn_snapshot_serve(reply: PasteReply, snapshot: std::sync::Arc<Snapshot>, mime: String) {
     std::thread::spawn(move || {
-        let mut reader = SnapshotReader::new(snapshot, mime);
+        let mut reader = SnapshotReader::new(snapshot, mime.clone());
         run_w2x(&reply, &mut reader);
     });
 }
@@ -134,12 +134,17 @@ fn run_w2x(reply: &PasteReply, reader: &mut impl Read) {
     let (conn, _) = match RustConnection::connect(None) {
         Ok(pair) => pair,
         Err(e) => {
-            warn!("W→X transfer: no X11 connection: {e}");
+            warn!("event=paste dir=w2x error={:?}", e.to_string());
             return;
         }
     };
     if let Err(e) = serve_w2x(&conn, reply, reader) {
-        warn!("W→X transfer failed: {e:#}");
+        warn!(
+            "event=paste dir=w2x sel={} mime={:?} error={:?}",
+            reply.kind.key(),
+            reply.mime,
+            format!("{e:#}")
+        );
         notify(&conn, &reply.req, None);
         let _ = conn.flush();
     }
@@ -162,7 +167,11 @@ fn serve_w2x(
                     if let Some(converted) = utf8_to_latin1(&data) {
                         converted
                     } else {
-                        warn!("source data is not valid UTF-8; refusing STRING conversion");
+                        warn!(
+                            "event=paste dir=w2x sel={} mime={:?} reason=invalid-utf8",
+                            reply.kind.key(),
+                            reply.mime
+                        );
                         notify(conn, &reply.req, None);
                         conn.flush()?;
                         return Ok(());
@@ -198,14 +207,23 @@ fn serve_w2x(
             .context("write requestor property")?;
             notify(conn, &reply.req, Some(reply.property));
             conn.flush()?;
-            debug!("served X11 paste: {} bytes", data.len());
+            debug!(
+                "event=paste dir=w2x sel={} mime={:?} bytes={} mode=single",
+                reply.kind.key(),
+                reply.mime,
+                data.len()
+            );
         }
         ReadOutcome::Overflow(head) => {
             if reply.conversion != Conv::None || reply.transform == Transform::StripCopyHeader {
                 // Charset conversion and header stripping need the whole
                 // payload; neither occurs on multi-megabyte content (text
                 // into STRING clients, file lists) in practice.
-                warn!("payload too large for charset conversion; refusing");
+                warn!(
+                    "event=paste dir=w2x sel={} mime={:?} reason=too-large-for-transform",
+                    reply.kind.key(),
+                    reply.mime
+                );
                 notify(conn, &reply.req, None);
                 conn.flush()?;
                 return Ok(());
@@ -288,7 +306,11 @@ fn serve_w2x_incr(
         &[],
     )?;
     conn.flush()?;
-    debug!("served X11 paste via INCR: {total} bytes");
+    debug!(
+        "event=paste dir=w2x sel={} mime={:?} bytes={total} mode=incr",
+        reply.kind.key(),
+        reply.mime
+    );
     Ok(())
 }
 
@@ -362,14 +384,14 @@ pub fn spawn_rope_to_fd(
     std::thread::spawn(move || {
         use std::io::Write as _;
         let mut out = std::fs::File::from(fd);
-        let mut reader = SnapshotReader::new(snapshot, mime);
+        let mut reader = SnapshotReader::new(snapshot, mime.clone());
         let mut buf = Zeroizing::new(vec![0_u8; CHUNK_SIZE]);
         while let Ok(n) = std::io::Read::read(&mut reader, &mut buf) {
             if n == 0 {
                 break;
             }
             if out.write_all(&buf[..n]).is_err() {
-                debug!("eager X→W: reader closed early (EPIPE)");
+                debug!("event=paste dir=x2w src=snapshot mime={mime:?} result=reader-closed");
                 break;
             }
         }
@@ -379,15 +401,20 @@ pub fn spawn_rope_to_fd(
 /// A Wayland client asked our data source for `request.mime`.
 pub fn spawn_x11_read(request: X2wRequest) {
     std::thread::spawn(move || {
+        let sel = request.kind.key();
+        let mime = request.mime.clone();
         if let Err(e) = serve_x2w(request) {
             // EPIPE is routine: history managers close their read end early.
             let broken_pipe = e
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
             if broken_pipe {
-                debug!("X→W transfer: reader closed early (EPIPE)");
+                debug!("event=paste dir=x2w sel={sel} mime={mime:?} result=reader-closed");
             } else {
-                warn!("X→W transfer failed: {e:#}");
+                warn!(
+                    "event=paste dir=x2w sel={sel} mime={mime:?} error={:?}",
+                    format!("{e:#}")
+                );
             }
         }
     });
@@ -486,13 +513,18 @@ fn serve_x2w(request: X2wRequest) -> anyhow::Result<()> {
                     conversion,
                     strip_pending: transform == Transform::StripCopyHeader,
                     total: 0,
+                    sel: kind.key(),
+                    mime,
                 };
                 return stream_x11_property(&conn, win, owner, &atoms, timeout, &mut sink);
             }
             _ => {} // owner refused this target — try the next candidate
         }
     }
-    warn!("X11 owner refused every candidate target for {mime:?}; serving empty paste");
+    warn!(
+        "event=paste dir=x2w sel={} mime={mime:?} reason=no-target",
+        kind.key()
+    );
     Ok(())
 }
 
@@ -529,6 +561,9 @@ struct Sink<'a> {
     /// `StripCopyHeader`: the leading action line has not been consumed yet.
     strip_pending: bool,
     total: usize,
+    /// Logging metadata.
+    sel: &'static str,
+    mime: &'a str,
 }
 
 impl Sink<'_> {
@@ -596,7 +631,10 @@ fn stream_x11_property(
     }
     conn.delete_property(win, atoms.CLIPFERRY)?;
     conn.flush()?;
-    debug!("served Wayland paste: {} bytes", sink.total);
+    debug!(
+        "event=paste dir=x2w sel={} mime={:?} bytes={} mode=single",
+        sink.sel, sink.mime, sink.total
+    );
     Ok(())
 }
 
@@ -642,7 +680,10 @@ fn stream_x11_incr(
     if let Some(io_err) = writer_gone {
         return Err(io_err.into());
     }
-    debug!("served Wayland paste via INCR: {} bytes", sink.total);
+    debug!(
+        "event=paste dir=x2w sel={} mime={:?} bytes={} mode=incr",
+        sink.sel, sink.mime, sink.total
+    );
     Ok(())
 }
 

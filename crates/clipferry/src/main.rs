@@ -45,7 +45,7 @@ fn main() -> ExitCode {
     match run(&options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            error!("{e:#}");
+            error!("event=exit error={:?}", format!("{e:#}"));
             ExitCode::FAILURE
         }
     }
@@ -61,7 +61,10 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     let qh = event_queue.handle();
     let manager = wayland::bind_manager(&globals, &qh)?;
     let seat = wayland::bind_seat(&globals, &qh)?;
-    info!("wayland: {} bound", manager.protocol_name());
+    info!(
+        "event=connect side=wayland protocol={}",
+        manager.protocol_name()
+    );
 
     if options.primary && !manager.supports_primary() {
         anyhow::bail!(
@@ -72,7 +75,7 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     let (x_conn, screen_num) = x11::connect_with_retry();
     let x = x11::X11::new(x_conn, screen_num, options.primary).context("initialize X11 backend")?;
     info!(
-        "x11: connected (vendor {:?}, XFIXES {}.{})",
+        "event=connect side=x11 vendor={:?} xfixes={}.{}",
         x.vendor(),
         x.xfixes_version.0,
         x.xfixes_version.1
@@ -140,12 +143,12 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         .map_err(|e| anyhow!("insert X11 source: {e}"))?;
 
     info!(
-        "bridging CLIPBOARD{} (all MIME types, bidirectional, {} mode)",
-        if options.primary { " + PRIMARY" } else { "" },
+        "event=ready mode={} primary={}",
         match options.sync_mode {
             cli::SyncMode::Lazy => "lazy",
             cli::SyncMode::Eager => "eager",
-        }
+        },
+        options.primary
     );
     event_loop
         .run(None, &mut app, |_| {})

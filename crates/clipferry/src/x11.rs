@@ -59,7 +59,7 @@ pub fn connect_with_retry() -> (Arc<RustConnection>, usize) {
             Ok((conn, screen)) => return (Arc::new(conn), screen),
             Err(e) => {
                 if !logged {
-                    info!("X11 connect failed ({e}); retrying until $DISPLAY appears");
+                    info!("event=retry side=x11 error={:?}", e.to_string());
                     logged = true;
                 }
                 std::thread::sleep(delay);
@@ -181,13 +181,16 @@ impl X11 {
         let owner = self.conn.get_selection_owner(selection)?.reply()?.owner;
         if owner == self.win {
             self.owned_since[kind.idx()] = Some(time);
-            info!("claimed X11 {} (proxying Wayland selection)", kind.label());
+            info!(
+                "event=claim side=x11 sel={} reason=proxy-wayland",
+                kind.key()
+            );
         } else {
             // Somebody beat us to it; XFIXES will tell us about them.
             self.owned_since[kind.idx()] = None;
             warn!(
-                "X11 {} claim lost the race (owner=0x{owner:x})",
-                kind.label()
+                "event=claim_race side=x11 sel={} owner=0x{owner:x}",
+                kind.key()
             );
         }
         self.conn.flush()?;
@@ -199,7 +202,7 @@ impl X11 {
             self.conn
                 .set_selection_owner(x11rb::NONE, self.selection_atom(kind), time)?;
             self.conn.flush()?;
-            info!("released X11 {}", kind.label());
+            info!("event=release side=x11 sel={}", kind.key());
         }
         Ok(())
     }
@@ -245,6 +248,24 @@ impl X11 {
             .reply()
             .context("read TARGETS property")?;
         Ok(reply.value32().map(Iterator::collect).unwrap_or_default())
+    }
+
+    /// Best-effort identification of an X11 client by window: `WM_CLASS`
+    /// (instance\0class\0). Wayland offers no equivalent, and /proc is
+    /// unreadable under our own Landlock — the X server is the only source.
+    pub fn owner_class(&self, win: Window) -> Option<String> {
+        let reply = self
+            .conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.value.is_empty() {
+            return None;
+        }
+        let parts: Vec<&[u8]> = reply.value.split(|&b| b == 0).collect();
+        let class = parts.iter().rev().find(|p| !p.is_empty())?;
+        Some(String::from_utf8_lossy(class).into_owned())
     }
 
     /// Resolve target atoms to their names; translation happens in
