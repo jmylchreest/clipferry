@@ -81,6 +81,8 @@ Transitions are driven by exactly two event kinds:
 1. **X11 `XFixesSelectionNotify`** → if the new owner is *not* clipferry's own window: fetch `TARGETS`, translate, claim the Wayland selection with a new data source offering those types. If the new owner *is* clipferry: ignore (this is our own proxy claim echoing back — this is the loop prevention, see §4.3).
 2. **Wayland `data_control_device::selection(offer)`** → if the offer is *not* from clipferry's own data source: read the offer's MIME list, translate, claim the X11 selection. If it is our own: ignore.
 
+**Startup: fill only the missing side.** On connect, query both selections (X11: `GetSelectionOwner` on CLIPBOARD; Wayland: data-control delivers the current selection — or null — on bind). If exactly one side is owned, proxy it to the empty side as if the ownership event had just fired. If **both** sides are owned, touch nothing — clobbering either would destroy real user data; the sides converge at the next copy. Neither owned → `Idle`. This rule is also what makes the crash-only restart policy (§4.4) clean: a restarted clipferry rebuilds truth from the live selections without disturbing them.
+
 ### 4.2 Lazy proxying (the key improvement over bash)
 
 When clipferry owns the Wayland selection as a proxy and a Wayland client pastes:
@@ -93,7 +95,7 @@ Mirror image for X11 paste (`SelectionRequest` → `wl_data_offer::receive`-equi
 
 **Consequence:** copying a 50 MB screenshot costs clipferry a MIME-list exchange (~bytes). The bash tool copies it twice through 6 processes immediately.
 
-**Timeout:** any in-flight transfer gets a deadline (default 5 s, `--transfer-timeout`); on expiry, close the fd / reply with an empty property, log at WARN.
+**Timeout:** `--transfer-timeout SECS`, default `0` = no timeout. When set, it is an **idle** timeout — it fires only when a transfer makes no progress for N seconds, never on total duration, so a slow-but-alive INCR transfer of a large payload is never killed mid-flight. On expiry: close the fd / reply with an empty property, log at WARN. Infinite-by-default is safe because transfers die with their consumer: when the pasting client closes its end, our write fails (EPIPE) and the transfer thread exits. The residual hang — an X11 owner that never answers `ConvertSelection` — leaks one waiting thread, bounded by concurrent pastes to that dead owner; users who care set a timeout.
 
 ### 4.2.1 Sync mode is configurable: `--sync-mode lazy|eager` (default: `lazy`)
 
@@ -118,6 +120,8 @@ No hashing, no sleeps, no races on identical content. An epoch counter (u64, inc
 ### 4.4 One event loop
 
 Use **calloop** (the Wayland ecosystem's event loop, already a dependency of wayland-rs users) with the X11 connection's raw fd registered as a source. Single thread. Blocking transfers (paste streaming) must not block the loop: do transfers on a small on-demand thread (`std::thread::spawn` per active transfer is acceptable — paste frequency is human-scale) or with non-blocking fd writes driven by the loop. **Decision: spawn-per-transfer**, it is simpler, correct, and the count is bounded by concurrent pastes (≈1).
+
+**Panic policy: crash-only.** `panic = "abort"` in the release profile — and that is the robustness design, not a size optimization (though it also drops unwind tables): a panic is by definition an invariant violation, after which the broker state cannot be trusted, and unwinding past it is how a clipboard bridge *silently* stops syncing — the worst failure mode. Abort → systemd restarts us in ~1 s → the startup fill-the-missing-side rule (§4.1) rebuilds truth from the live selections. All *expected* failures (protocol errors, EPIPE, timeouts, malformed offers) are `Result`s and must never panic; `unwrap` is lint-banned in production paths. Two consequences, both handled: (1) abort skips `Drop`, so `Zeroizing` buffers are not zeroed on the way down — closed by the kernel, which zeroes pages before reuse by another process, and by `PR_SET_DUMPABLE=0` (§8.1), so the dying image is never written anywhere; (2) a deterministic content-triggered panic would crash-loop, so the unit uses exponential restart backoff (`RestartSec=1`, `RestartSteps=5`, `RestartMaxDelaySec=30`, `StartLimitIntervalSec=0` — never give up permanently; a dead bridge is worse than a slow retry, and the journal makes a loop visible). Dev/test profiles keep default unwinding, so `cargo test` is unaffected.
 
 ## 5. Wayland backend
 
@@ -168,7 +172,9 @@ Clipboard bytes pass through (lazy) or rest in (eager) clipferry's memory. The c
 | Eager snapshot (per MIME type) | while it is the current selection — that's its purpose; it cannot be zeroed "after sync" | when replaced by the next claim, when the selection goes `Idle` (source cleared / owner exited and we drop the proxy), and on clean shutdown |
 | INCR reassembly state | duration of one chunked transfer | same as streaming buffer, including partial-transfer aborts |
 
-**Implementation:** the `zeroize` crate — all payload-carrying fields are `Zeroizing<Vec<u8>>` (zero-on-drop), never bare `Vec<u8>`. This is a **type-level invariant**, not a call-site discipline: no function in the codebase may accept or return clipboard payload as a bare `Vec<u8>`/`String`, so abort paths get zeroing for free from drop semantics. Enforce in code review; a grep for `Vec<u8>` in the broker/transfer modules should hit nothing payload-carrying.
+**Implementation:** the `zeroize` crate, with one sharp edge designed around: `Zeroizing<Vec<u8>>` zeroes only the buffer's *final* allocation — a `Vec` that grows reallocates, and the old blocks return to the allocator **un-zeroed**, exactly the freed-heap leak this section exists to prevent. Payload therefore never lives in a growable `Vec`. Payload storage is a **chunk rope**: `Vec<Zeroizing<Box<[u8]>>>` of fixed 64 KiB chunks. Bytes are read directly into a fresh chunk, chunks are never reallocated or moved, and each zeroes on drop; the outer index Vec holds only pointers and lengths (not secret) and may realloc freely. The rope composes with everything else here: INCR data arrives pre-chunked anyway, the `--eager-max-size` cap is enforced per-chunk while streaming, and `mlock` is applied per-chunk as allocated. Where a contiguous slice is unavoidable (an X11 non-INCR `ChangeProperty` needs one buffer, ≤ max-request-size), copy into a temporary `Zeroizing` buffer for the call and let it drop.
+
+The invariant remains **type-level**, not call-site discipline: no function in the codebase may accept or return clipboard payload as a bare `Vec<u8>`/`String`, so abort paths get zeroing for free from drop semantics. Enforce in code review; a grep for `Vec<u8>` in the broker/transfer modules should hit nothing payload-carrying.
 
 **Side channels closed while buffers are legitimately alive:**
 
@@ -209,6 +215,8 @@ clipferry [--sync-mode lazy|eager] [--eager-max-size BYTES] [--primary] [--skip-
 [Unit]
 Description=clipferry — X11 <-> Wayland clipboard bridge
 After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=0
 # Only needed on satellite-style compositors; users gate per-session, e.g.:
 # ConditionEnvironment=XDG_CURRENT_DESKTOP=niri  (as a drop-in, not shipped)
 
@@ -217,6 +225,8 @@ Type=simple
 ExecStart=/usr/bin/clipferry
 Restart=always
 RestartSec=1
+RestartSteps=5
+RestartMaxDelaySec=30
 # Hardening — we need only the two sockets and stderr:
 ProtectSystem=strict
 ProtectHome=read-only
