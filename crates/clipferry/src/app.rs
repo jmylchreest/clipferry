@@ -9,9 +9,11 @@ use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{Atom, AtomEnum, SelectionRequestEvent};
 
+use wayland_client::QueueHandle;
+
 use crate::broker::{Broker, Command};
 use crate::transfer::{self, PasteReply};
-use crate::wayland::Offer;
+use crate::wayland::{Device, Manager, Offer, Source};
 use crate::x11::X11;
 use crate::{broker, mime};
 
@@ -19,18 +21,38 @@ pub struct App {
     pub broker: Broker,
     pub x11: X11,
     pub wl_conn: wayland_client::Connection,
+    pub manager: Manager,
+    pub device: Device,
+    pub qh: QueueHandle<Self>,
     pub current_offer: Option<Offer>,
+    /// Our own data source while we proxy X→W. Identity anchor for the §4.3
+    /// Wayland-side loop rule: while this is alive, any selection event is
+    /// our own claim echoing back (a real takeover cancels the source first).
+    pub our_source: Option<Source>,
+    /// Epoch of the in-flight TARGETS fetch, if any (§4.3 staleness guard).
+    pending_targets_epoch: Option<u64>,
     pub exit: Option<anyhow::Error>,
     pub loop_signal: Option<LoopSignal>,
 }
 
 impl App {
-    pub const fn new(x11: X11, wl_conn: wayland_client::Connection) -> Self {
+    pub const fn new(
+        x11: X11,
+        wl_conn: wayland_client::Connection,
+        manager: Manager,
+        device: Device,
+        qh: QueueHandle<Self>,
+    ) -> Self {
         Self {
             broker: Broker::new(),
             x11,
             wl_conn,
+            manager,
+            device,
+            qh,
             current_offer: None,
+            our_source: None,
+            pending_targets_epoch: None,
             exit: None,
             loop_signal: None,
         }
@@ -39,6 +61,15 @@ impl App {
     // --- Wayland side --------------------------------------------------
 
     pub fn on_wayland_selection(&mut self, offer: Option<Offer>) {
+        // Loop prevention by identity (§4.3): while our own source is alive,
+        // this event is our claim echoing back — a real takeover would have
+        // cancelled the source first (same-connection event ordering).
+        if self.our_source.is_some() {
+            if let Some(o) = offer {
+                o.destroy();
+            }
+            return;
+        }
         if let Some(old) = self.current_offer.take() {
             old.destroy();
         }
@@ -70,6 +101,50 @@ impl App {
         self.fatal(anyhow!("compositor finished our data-control device"));
     }
 
+    /// A Wayland client pastes from our proxy source: stream from the X11
+    /// owner (lazy, §4.2).
+    pub fn on_source_send(&mut self, source: &Source, mime: &str, fd: std::os::fd::OwnedFd) {
+        let is_current = self
+            .our_source
+            .as_ref()
+            .is_some_and(|s| s.id() == source.id());
+        if !is_current {
+            debug!("send request on a superseded source; dropping (empty paste)");
+            return; // dropping fd closes the pipe → empty paste
+        }
+        transfer::spawn_x11_read(mime.to_owned(), fd);
+    }
+
+    /// The compositor cancelled a source of ours (someone else claimed, or
+    /// we replaced our own claim).
+    pub fn on_source_cancelled(&mut self, source: &Source) {
+        source.destroy();
+        if self
+            .our_source
+            .as_ref()
+            .is_some_and(|s| s.id() == source.id())
+        {
+            self.our_source = None;
+        }
+    }
+
+    /// Startup rule (§4.1), X11 half: if nothing came from the initial
+    /// Wayland roundtrip but a real X11 app owns CLIPBOARD, fill the
+    /// missing Wayland side.
+    pub fn probe_x11_startup(&mut self) {
+        if !matches!(self.broker.state(), broker::State::Idle) {
+            return;
+        }
+        match self.x11.selection_owner() {
+            Ok(owner) if owner != x11rb::NONE && owner != self.x11.win => {
+                info!("startup: X11 CLIPBOARD has an owner; filling the Wayland side");
+                self.dispatch_broker(broker::Event::X11Selection);
+            }
+            Ok(_) => {}
+            Err(e) => self.fatal(e.context("startup X11 owner probe")),
+        }
+    }
+
     // --- X11 side --------------------------------------------------------
 
     pub fn drain_x11(&mut self) -> anyhow::Result<()> {
@@ -87,6 +162,39 @@ impl App {
                 self.dispatch_broker(broker::Event::X11Lost);
             }
             Event::SelectionRequest(req) => self.on_selection_request(*req),
+            Event::XfixesSelectionNotify(e) if e.selection == self.x11.atoms.CLIPBOARD => {
+                // Loop prevention by identity (§4.3), X11 side: our own
+                // claims echo back with owner == our window — skip them.
+                if e.owner == self.x11.win {
+                    return;
+                }
+                if e.owner == x11rb::NONE {
+                    self.dispatch_broker(broker::Event::X11Cleared);
+                } else {
+                    debug!("X11 CLIPBOARD claimed by 0x{:x}", e.owner);
+                    self.dispatch_broker(broker::Event::X11Selection);
+                }
+            }
+            // TARGETS reply for a FetchX11Targets command.
+            Event::SelectionNotify(e)
+                if e.requestor == self.x11.win && e.target == self.x11.atoms.TARGETS =>
+            {
+                let Some(epoch) = self.pending_targets_epoch.take() else {
+                    return;
+                };
+                let mime_types = if e.property == x11rb::NONE {
+                    Vec::new() // owner refused TARGETS — nothing to bridge
+                } else {
+                    match self.x11.read_targets_property() {
+                        Ok(targets) => self.x11.targets_to_mimes(&targets),
+                        Err(err) => {
+                            debug!("reading TARGETS reply failed: {err:#}");
+                            Vec::new()
+                        }
+                    }
+                };
+                self.dispatch_broker(broker::Event::X11Targets { epoch, mime_types });
+            }
             _ => {}
         }
     }
@@ -233,6 +341,38 @@ impl App {
             Command::ReleaseX11 => {
                 if let Err(e) = self.x11.release() {
                     self.fatal(e.context("release X11 selection"));
+                }
+            }
+            Command::FetchX11Targets { epoch } => {
+                self.pending_targets_epoch = Some(*epoch);
+                if let Err(e) = self.x11.fetch_targets() {
+                    self.fatal(e.context("fetch X11 TARGETS"));
+                }
+            }
+            Command::ClaimWayland { mime_types, .. } => {
+                // Replacing our own claim: drop the old source now; its
+                // Cancelled event dies with the destroyed proxy.
+                if let Some(old) = self.our_source.take() {
+                    old.destroy();
+                }
+                let source = self.manager.create_source(mime_types, &self.qh);
+                self.device.set_selection(Some(&source));
+                self.our_source = Some(source);
+                if let Err(e) = self.wl_conn.flush() {
+                    self.fatal(anyhow!(e).context("flush Wayland after claim"));
+                } else {
+                    info!("claimed Wayland selection (proxying X11 owner)");
+                }
+            }
+            Command::ReleaseWayland => {
+                if let Some(source) = self.our_source.take() {
+                    self.device.set_selection(None);
+                    source.destroy();
+                    if let Err(e) = self.wl_conn.flush() {
+                        self.fatal(anyhow!(e).context("flush Wayland after release"));
+                    } else {
+                        info!("released Wayland selection");
+                    }
                 }
             }
         }

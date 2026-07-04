@@ -16,11 +16,13 @@ use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::ExtDataControlManagerV1,
     ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
 };
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
+    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
 use crate::app::App;
@@ -65,11 +67,67 @@ impl Manager {
             Self::Wlr(m) => Device::Wlr(m.get_data_device(seat, qh, ())),
         }
     }
+
+    /// Create a data source offering `mime_types` (our proxy claim for an
+    /// X11 owner).
+    pub fn create_source(&self, mime_types: &[String], qh: &QueueHandle<App>) -> Source {
+        match self {
+            Self::Ext(m) => {
+                let s = m.create_data_source(qh, ());
+                for mime in mime_types {
+                    s.offer(mime.clone());
+                }
+                Source::Ext(s)
+            }
+            Self::Wlr(m) => {
+                let s = m.create_data_source(qh, ());
+                for mime in mime_types {
+                    s.offer(mime.clone());
+                }
+                Source::Wlr(s)
+            }
+        }
+    }
 }
 
 pub enum Device {
     Ext(ExtDataControlDeviceV1),
     Wlr(ZwlrDataControlDeviceV1),
+}
+
+impl Device {
+    pub fn set_selection(&self, source: Option<&Source>) {
+        match (self, source) {
+            (Self::Ext(d), Some(Source::Ext(s))) => d.set_selection(Some(s)),
+            (Self::Ext(d), None) => d.set_selection(None),
+            (Self::Wlr(d), Some(Source::Wlr(s))) => d.set_selection(Some(s)),
+            (Self::Wlr(d), None) => d.set_selection(None),
+            // Device and source always come from the same bound manager.
+            _ => unreachable!("data-control protocol mismatch between device and source"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum Source {
+    Ext(ExtDataControlSourceV1),
+    Wlr(ZwlrDataControlSourceV1),
+}
+
+impl Source {
+    pub fn id(&self) -> wayland_client::backend::ObjectId {
+        match self {
+            Self::Ext(s) => s.id(),
+            Self::Wlr(s) => s.id(),
+        }
+    }
+
+    pub fn destroy(&self) {
+        match self {
+            Self::Ext(s) => s.destroy(),
+            Self::Wlr(s) => s.destroy(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -193,6 +251,48 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
     event_created_child!(App, ZwlrDataControlDeviceV1, [
         zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, OfferMimes::default()),
     ]);
+}
+
+impl Dispatch<ExtDataControlSourceV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.on_source_send(&Source::Ext(proxy.clone()), &mime_type, fd);
+            }
+            ext_data_control_source_v1::Event::Cancelled => {
+                state.on_source_cancelled(&Source::Ext(proxy.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlSourceV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrDataControlSourceV1,
+        event: zwlr_data_control_source_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.on_source_send(&Source::Wlr(proxy.clone()), &mime_type, fd);
+            }
+            zwlr_data_control_source_v1::Event::Cancelled => {
+                state.on_source_cancelled(&Source::Wlr(proxy.clone()));
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Dispatch<ExtDataControlOfferV1, OfferMimes> for App {

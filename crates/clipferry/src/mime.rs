@@ -10,6 +10,16 @@ const TEXT_MIMES: &[&str] = &[
     "STRING",
 ];
 
+/// MIME types we advertise on the Wayland side when proxying an X11 text
+/// owner (X→W direction).
+pub const X2W_TEXT_MIMES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+];
+
 pub fn pick_text(mime_types: &[String]) -> Option<&'static str> {
     TEXT_MIMES
         .iter()

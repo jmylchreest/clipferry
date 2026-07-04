@@ -10,7 +10,7 @@ use log::{info, warn};
 use x11rb::atom_manager;
 use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::protocol::Event;
-use x11rb::protocol::xfixes::ConnectionExt as _;
+use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, Timestamp, Window, WindowClass,
 };
@@ -27,7 +27,10 @@ atom_manager! {
         INCR,
         UTF8_STRING,
         TEXT,
+        TEXT_PLAIN: b"text/plain",
+        TEXT_PLAIN_UTF8: b"text/plain;charset=utf-8",
         CLIPFERRY: b"_CLIPFERRY",
+        CLIPFERRY_TARGETS: b"_CLIPFERRY_TARGETS",
     }
 }
 
@@ -89,6 +92,14 @@ impl X11 {
             .context("XFIXES is mandatory (§6)")?
             .reply()
             .context("XFIXES version handshake")?;
+        conn.xfixes_select_selection_input(
+            win,
+            atoms.CLIPBOARD,
+            xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+        )
+        .context("subscribe to XFIXES selection events")?;
 
         // Headroom under the max request size for the ChangeProperty header.
         let max_payload = conn.maximum_request_bytes().saturating_sub(1024);
@@ -170,5 +181,65 @@ impl X11 {
             info!("released X11 CLIPBOARD");
         }
         Ok(())
+    }
+
+    /// Current CLIPBOARD owner window (0 = none). Startup probe (§4.1).
+    pub fn selection_owner(&self) -> anyhow::Result<Window> {
+        Ok(self
+            .conn
+            .get_selection_owner(self.atoms.CLIPBOARD)?
+            .reply()?
+            .owner)
+    }
+
+    /// Ask the current X11 owner for its TARGETS; the reply lands as a
+    /// `SelectionNotify` in the main event loop.
+    pub fn fetch_targets(&self) -> anyhow::Result<()> {
+        self.conn.convert_selection(
+            self.win,
+            self.atoms.CLIPBOARD,
+            self.atoms.TARGETS,
+            self.atoms.CLIPFERRY_TARGETS,
+            x11rb::CURRENT_TIME,
+        )?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Read and delete the TARGETS reply property; returns the target atoms.
+    pub fn read_targets_property(&self) -> anyhow::Result<Vec<x11rb::protocol::xproto::Atom>> {
+        let reply = self
+            .conn
+            .get_property(
+                true, // delete
+                self.win,
+                self.atoms.CLIPFERRY_TARGETS,
+                AtomEnum::ATOM,
+                0,
+                u32::MAX / 4,
+            )?
+            .reply()
+            .context("read TARGETS property")?;
+        Ok(reply.value32().map(Iterator::collect).unwrap_or_default())
+    }
+
+    /// M2: translate the owner's target atoms to the Wayland MIME types we
+    /// can proxy (text only until M3).
+    pub fn targets_to_mimes(&self, targets: &[x11rb::protocol::xproto::Atom]) -> Vec<String> {
+        let text_atoms = [
+            self.atoms.UTF8_STRING,
+            self.atoms.TEXT,
+            self.atoms.TEXT_PLAIN,
+            self.atoms.TEXT_PLAIN_UTF8,
+            x11rb::protocol::xproto::Atom::from(AtomEnum::STRING),
+        ];
+        if targets.iter().any(|t| text_atoms.contains(t)) {
+            crate::mime::X2W_TEXT_MIMES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 }
