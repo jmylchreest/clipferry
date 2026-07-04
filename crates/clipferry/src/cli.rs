@@ -4,11 +4,48 @@
 use anyhow::bail;
 use log::LevelFilter;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    #[default]
+    Lazy,
+    Eager,
+}
+
 pub struct Options {
     pub oneshot_check: bool,
     pub log_level: LevelFilter,
     /// §4.2 idle timeout in seconds; 0 (default) = no timeout.
     pub transfer_timeout: u64,
+    /// §4.2.1 transfer strategy.
+    pub sync_mode: SyncMode,
+    /// Per-type eager snapshot cap in bytes; `None` = unlimited.
+    pub eager_max_size: Option<usize>,
+    /// Also bridge the PRIMARY selection (§3 non-goal by default).
+    pub primary: bool,
+    /// Do not bridge offers carrying the KDE password-manager hint (§8).
+    pub skip_sensitive: bool,
+}
+
+/// Parse a human size: plain bytes, `K`/`M`/`G` (binary) suffixes, or the
+/// literals `0`/`unlimited` for "no cap" (§4.2.1).
+pub fn parse_size(text: &str) -> anyhow::Result<Option<usize>> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("unlimited") || t == "0" {
+        return Ok(None);
+    }
+    let (digits, mult): (&str, usize) = match t.as_bytes().last() {
+        Some(b'K' | b'k') => (&t[..t.len() - 1], 1 << 10),
+        Some(b'M' | b'm') => (&t[..t.len() - 1], 1 << 20),
+        Some(b'G' | b'g') => (&t[..t.len() - 1], 1 << 30),
+        _ => (t, 1),
+    };
+    let value: usize = digits.parse().map_err(|_| {
+        anyhow::anyhow!("invalid size {text:?} (expected e.g. 10M, 512K, 1G, unlimited)")
+    })?;
+    value
+        .checked_mul(mult)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("size {text:?} overflows"))
 }
 
 pub enum Parsed {
@@ -23,9 +60,14 @@ clipferry — X11 <-> Wayland clipboard bridge
 Usage: clipferry [OPTIONS]
 
 Options:
+      --sync-mode MODE         lazy|eager  [default: lazy]
+      --eager-max-size SIZE    Per-type eager snapshot cap (10M, 512K, 1G,
+                               0/unlimited = no cap)  [default: 10M]
+      --primary                Also bridge the PRIMARY selection
+      --skip-sensitive         Do not bridge password-manager-hinted offers
+      --transfer-timeout SECS  Idle timeout for payload transfers; 0 = none  [default: 0]
       --oneshot-check          Connect to both displays, print a diagnostic, exit
       --log-level LEVEL        error|warn|info|debug|trace  [default: info]
-      --transfer-timeout SECS  Idle timeout for payload transfers; 0 = none  [default: 0]
   -V, --version            Print version
   -h, --help               Print this help
 ";
@@ -42,10 +84,34 @@ fn parse_from(mut parser: lexopt::Parser) -> anyhow::Result<Parsed> {
         oneshot_check: false,
         log_level: LevelFilter::Info,
         transfer_timeout: 0,
+        sync_mode: SyncMode::Lazy,
+        eager_max_size: Some(10 << 20),
+        primary: false,
+        skip_sensitive: false,
     };
     while let Some(arg) = parser.next()? {
         match arg {
             Long("oneshot-check") => options.oneshot_check = true,
+            Long("primary") => options.primary = true,
+            Long("skip-sensitive") => options.skip_sensitive = true,
+            Long("sync-mode") => {
+                let value = parser.value()?;
+                options.sync_mode = match value.to_str() {
+                    Some("lazy") => SyncMode::Lazy,
+                    Some("eager") => SyncMode::Eager,
+                    _ => bail!(
+                        "--sync-mode: expected lazy|eager, got {}",
+                        value.to_string_lossy()
+                    ),
+                };
+            }
+            Long("eager-max-size") => {
+                let value = parser.value()?;
+                let Some(text) = value.to_str() else {
+                    bail!("--eager-max-size: invalid UTF-8");
+                };
+                options.eager_max_size = parse_size(text)?;
+            }
             Long("transfer-timeout") => {
                 options.transfer_timeout = parser.value()?.parse()?;
             }
@@ -119,6 +185,41 @@ mod tests {
             panic!("expected Run")
         };
         assert_eq!(o.transfer_timeout, 0);
+        assert_eq!(o.sync_mode, SyncMode::Lazy);
+        assert_eq!(o.eager_max_size, Some(10 << 20));
+        assert!(!o.primary);
+        assert!(!o.skip_sensitive);
+    }
+
+    #[test]
+    fn m4_flags_parse() {
+        let Parsed::Run(o) = run(&[
+            "--sync-mode",
+            "eager",
+            "--eager-max-size",
+            "512K",
+            "--primary",
+            "--skip-sensitive",
+        ])
+        .unwrap() else {
+            panic!("expected Run")
+        };
+        assert_eq!(o.sync_mode, SyncMode::Eager);
+        assert_eq!(o.eager_max_size, Some(512 << 10));
+        assert!(o.primary);
+        assert!(o.skip_sensitive);
+    }
+
+    #[test]
+    fn size_parsing() {
+        assert_eq!(parse_size("10M").unwrap(), Some(10 << 20));
+        assert_eq!(parse_size("512k").unwrap(), Some(512 << 10));
+        assert_eq!(parse_size("1G").unwrap(), Some(1 << 30));
+        assert_eq!(parse_size("12345").unwrap(), Some(12345));
+        assert_eq!(parse_size("0").unwrap(), None);
+        assert_eq!(parse_size("unlimited").unwrap(), None);
+        assert!(parse_size("ten").is_err());
+        assert!(parse_size("10T").is_err());
     }
 
     #[test]

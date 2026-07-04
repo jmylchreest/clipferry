@@ -59,8 +59,14 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     let seat = wayland::bind_seat(&globals, &qh)?;
     info!("wayland: {} bound", manager.protocol_name());
 
+    if options.primary && !manager.supports_primary() {
+        anyhow::bail!(
+            "--primary needs ext-data-control-v1 or zwlr-data-control v2; \
+             this compositor offers neither"
+        );
+    }
     let (x_conn, screen_num) = x11::connect_with_retry();
-    let x = x11::X11::new(x_conn, screen_num).context("initialize X11 backend")?;
+    let x = x11::X11::new(x_conn, screen_num, options.primary).context("initialize X11 backend")?;
     info!(
         "x11: connected (vendor {:?}, XFIXES {}.{})",
         x.vendor(),
@@ -85,9 +91,7 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     }
 
     let device = manager.get_data_device(&seat, &qh);
-    let timeout = (options.transfer_timeout > 0)
-        .then(|| std::time::Duration::from_secs(options.transfer_timeout));
-    let mut app = App::new(x, wl_conn.clone(), manager, device, qh, timeout);
+    let mut app = App::new(x, wl_conn.clone(), manager, device, qh, options);
 
     // Startup rule (§4.1): the roundtrip delivers the current Wayland
     // selection (if any); the probe fills the Wayland side if only X11 has
@@ -99,6 +103,19 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
 
     let mut event_loop = EventLoop::<App>::try_new().context("create event loop")?;
     app.loop_signal = Some(event_loop.get_signal());
+    app.loop_handle = Some(event_loop.handle());
+
+    // Eager snapshots (§4.2.1) land back on the loop through this channel.
+    let (snapshot_tx, snapshot_rx) = calloop::channel::channel();
+    app.snapshot_tx = Some(snapshot_tx);
+    event_loop
+        .handle()
+        .insert_source(snapshot_rx, |msg, (), app: &mut App| {
+            if let calloop::channel::Event::Msg(msg) = msg {
+                app.on_snapshot(msg);
+            }
+        })
+        .map_err(|e| anyhow!("insert snapshot channel: {e}"))?;
 
     WaylandSource::new(wl_conn, event_queue)
         .insert(event_loop.handle())
@@ -114,7 +131,14 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow!("insert X11 source: {e}"))?;
 
-    info!("bridging CLIPBOARD (all MIME types, bidirectional)");
+    info!(
+        "bridging CLIPBOARD{} (all MIME types, bidirectional, {} mode)",
+        if options.primary { " + PRIMARY" } else { "" },
+        match options.sync_mode {
+            cli::SyncMode::Lazy => "lazy",
+            cli::SyncMode::Eager => "eager",
+        }
+    );
     event_loop
         .run(None, &mut app, |_| {})
         .context("event loop")?;

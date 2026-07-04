@@ -1,44 +1,80 @@
-//! Glue between the sans-IO broker and the two backends: wayland events come
-//! in via the Dispatch impls (wayland.rs), X11 events via `drain_x11`, and
-//! broker commands fan back out to the backends.
+//! Glue between the sans-IO brokers (one per selection) and the two
+//! backends: Wayland events come in via the Dispatch impls (wayland.rs),
+//! X11 events via `drain_x11`, and broker commands fan back out.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
-use calloop::LoopSignal;
+use calloop::{LoopHandle, LoopSignal};
 use log::{debug, error, info};
+use wayland_client::QueueHandle;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{Atom, AtomEnum, SelectionRequestEvent};
 
-use std::collections::HashMap;
-use std::time::Duration;
-
-use wayland_client::QueueHandle;
-
 use crate::broker::{Broker, Command};
-use crate::transfer::{self, Conv, PasteReply};
+use crate::cli::SyncMode;
+use crate::mime::Transform;
+use crate::payload::{PayloadRope, ReadOutcome, Snapshot};
+use crate::transfer::{self, Conv, PasteReply, X2wRequest};
 use crate::wayland::{Device, Manager, Offer, Source};
 use crate::x11::X11;
-use crate::{broker, mime};
+use crate::{SelKind, broker, mime};
+
+/// How long PRIMARY owner changes are debounced (§14): highlight-drag
+/// generates high-frequency changes; only the settled owner matters.
+const PRIMARY_DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// Per-selection state: broker plus everything a proxy claim carries.
+#[derive(Default)]
+struct SelCtx {
+    broker: Broker,
+    current_offer: Option<Offer>,
+    /// Our own data source while proxying X→W. Identity anchor for the §4.3
+    /// Wayland-side loop rule: while this is alive, any selection event is
+    /// our own claim echoing back (a real takeover cancels the source first).
+    our_source: Option<Source>,
+    /// W→X: atom → (source MIME to read, transform) for advertised targets.
+    proxy_targets: HashMap<Atom, (String, Transform)>,
+    /// X→W: advertised MIME → (x11 target, transform) read-plan overrides.
+    x2w_plans: HashMap<String, (String, Transform)>,
+    pending_targets_epoch: Option<u64>,
+    /// §8: the current offer carries the password-manager hint.
+    sensitive: bool,
+    /// §4.2.1 eager snapshot for the current claim.
+    snapshot: Option<Arc<Snapshot>>,
+}
+
+/// Pending debounced PRIMARY change (either side; the latest wins).
+enum PendingPrimary {
+    Wayland(Option<Offer>),
+    X11 { has_owner: bool },
+}
+
+/// Result of an eager snapshot fetch, delivered via the calloop channel.
+pub struct SnapshotMsg {
+    pub kind: SelKind,
+    pub snapshot: Snapshot,
+}
 
 pub struct App {
-    pub broker: Broker,
     pub x11: X11,
     pub wl_conn: wayland_client::Connection,
     pub manager: Manager,
     pub device: Device,
     pub qh: QueueHandle<Self>,
-    pub current_offer: Option<Offer>,
-    /// Our own data source while we proxy X→W. Identity anchor for the §4.3
-    /// Wayland-side loop rule: while this is alive, any selection event is
-    /// our own claim echoing back (a real takeover cancels the source first).
-    pub our_source: Option<Source>,
-    /// Epoch of the in-flight TARGETS fetch, if any (§4.3 staleness guard).
-    pending_targets_epoch: Option<u64>,
-    /// Atom → MIME map for our current W→X proxy claim: the arbitrary
-    /// targets we advertise on X11 beyond the text aliases (§7 pass-through).
-    proxy_targets: HashMap<Atom, String>,
-    /// §4.2 idle timeout for payload transfers; `None` = infinite (default).
+    ctx: [SelCtx; 2],
+    pub primary: bool,
+    pub skip_sensitive: bool,
+    pub sync_mode: SyncMode,
+    pub eager_max: Option<usize>,
     pub transfer_timeout: Option<Duration>,
+    pub snapshot_tx: Option<calloop::channel::Sender<SnapshotMsg>>,
+    pub loop_handle: Option<LoopHandle<'static, Self>>,
+    pending_primary: Option<PendingPrimary>,
+    primary_gen: u64,
     pub exit: Option<anyhow::Error>,
     pub loop_signal: Option<LoopSignal>,
 }
@@ -50,47 +86,81 @@ impl App {
         manager: Manager,
         device: Device,
         qh: QueueHandle<Self>,
-        transfer_timeout: Option<Duration>,
+        options: &crate::cli::Options,
     ) -> Self {
         Self {
-            broker: Broker::new(),
             x11,
             wl_conn,
             manager,
             device,
             qh,
-            current_offer: None,
-            our_source: None,
-            pending_targets_epoch: None,
-            proxy_targets: HashMap::new(),
-            transfer_timeout,
+            ctx: [SelCtx::default(), SelCtx::default()],
+            primary: options.primary,
+            skip_sensitive: options.skip_sensitive,
+            sync_mode: options.sync_mode,
+            eager_max: options.eager_max_size,
+            transfer_timeout: (options.transfer_timeout > 0)
+                .then(|| Duration::from_secs(options.transfer_timeout)),
+            snapshot_tx: None,
+            loop_handle: None,
+            pending_primary: None,
+            primary_gen: 0,
             exit: None,
             loop_signal: None,
         }
     }
 
-    // --- Wayland side --------------------------------------------------
+    // --- Wayland side -----------------------------------------------------
 
-    pub fn on_wayland_selection(&mut self, offer: Option<Offer>) {
+    pub fn on_wayland_selection(&mut self, kind: SelKind, offer: Option<Offer>) {
         // Loop prevention by identity (§4.3): while our own source is alive,
         // this event is our claim echoing back — a real takeover would have
         // cancelled the source first (same-connection event ordering).
-        if self.our_source.is_some() {
+        if self.ctx[kind.idx()].our_source.is_some() {
             if let Some(o) = offer {
                 o.destroy();
             }
             return;
         }
-        if let Some(old) = self.current_offer.take() {
+        if kind == SelKind::Primary {
+            self.debounce_primary(PendingPrimary::Wayland(offer));
+            return;
+        }
+        self.process_wayland_selection(kind, offer);
+    }
+
+    pub fn on_wayland_primary(&mut self, offer: Option<Offer>) {
+        if self.primary {
+            self.on_wayland_selection(SelKind::Primary, offer);
+        } else if let Some(o) = offer {
+            o.destroy();
+        }
+    }
+
+    fn process_wayland_selection(&mut self, kind: SelKind, offer: Option<Offer>) {
+        if let Some(old) = self.ctx[kind.idx()].current_offer.take() {
             old.destroy();
         }
         if let Some(offer) = offer {
             let mime_types = offer.mime_types();
-            debug!(
-                "wayland selection changed: {} MIME types offered",
-                mime_types.len()
-            );
-            self.current_offer = Some(offer);
+            let sensitive = mime::is_sensitive(&mime_types);
+            self.ctx[kind.idx()].sensitive = sensitive;
+            if sensitive {
+                if self.skip_sensitive {
+                    info!("[sensitive] Wayland offer skipped (--skip-sensitive)");
+                    offer.destroy();
+                    self.dispatch_broker(kind, broker::Event::WaylandCleared);
+                    return;
+                }
+                info!("[sensitive] Wayland selection changed on {}", kind.label());
+            } else {
+                debug!(
+                    "wayland {} changed: {} MIME types offered",
+                    kind.label(),
+                    mime_types.len()
+                );
+            }
+            self.ctx[kind.idx()].current_offer = Some(offer);
             // §7: bridge everything except X11 protocol machinery names.
             let bridgeable: Vec<String> = mime_types
                 .into_iter()
@@ -104,10 +174,16 @@ impl App {
                     mime_types: bridgeable,
                 }
             };
-            self.dispatch_broker(event);
+            self.dispatch_broker(kind, event);
+        } else if self.survives_source_exit(kind, false) {
+            debug!(
+                "Wayland source exited; serving {} from eager snapshot",
+                kind.label()
+            );
         } else {
-            debug!("wayland selection cleared");
-            self.dispatch_broker(broker::Event::WaylandCleared);
+            debug!("wayland {} cleared", kind.label());
+            self.ctx[kind.idx()].sensitive = false;
+            self.dispatch_broker(kind, broker::Event::WaylandCleared);
         }
     }
 
@@ -118,9 +194,16 @@ impl App {
     }
 
     /// A Wayland client pastes from our proxy source: stream from the X11
-    /// owner (lazy, §4.2).
-    pub fn on_source_send(&mut self, source: &Source, mime: &str, fd: std::os::fd::OwnedFd) {
-        let is_current = self
+    /// owner (lazy, §4.2) or the eager snapshot (§4.2.1).
+    pub fn on_source_send(
+        &mut self,
+        kind: SelKind,
+        source: &Source,
+        mime: &str,
+        fd: std::os::fd::OwnedFd,
+    ) {
+        let ctx = &self.ctx[kind.idx()];
+        let is_current = ctx
             .our_source
             .as_ref()
             .is_some_and(|s| s.id() == source.id());
@@ -128,40 +211,103 @@ impl App {
             debug!("send request on a superseded source; dropping (empty paste)");
             return; // dropping fd closes the pipe → empty paste
         }
-        transfer::spawn_x11_read(mime.to_owned(), fd, self.transfer_timeout);
+        // Over-cap types miss the snapshot and degrade to lazy (§4.2.1).
+        if let Some(snapshot) = &ctx.snapshot
+            && snapshot.data.contains_key(mime)
+        {
+            transfer::spawn_rope_to_fd(snapshot.clone(), mime.to_owned(), fd);
+            return;
+        }
+        let plan = ctx.x2w_plans.get(mime).cloned();
+        transfer::spawn_x11_read(X2wRequest {
+            mime: mime.to_owned(),
+            plan,
+            kind,
+            fd,
+            timeout: self.transfer_timeout,
+        });
     }
 
     /// The compositor cancelled a source of ours (someone else claimed, or
     /// we replaced our own claim).
-    pub fn on_source_cancelled(&mut self, source: &Source) {
+    pub fn on_source_cancelled(&mut self, kind: SelKind, source: &Source) {
         source.destroy();
-        if self
+        let ctx = &mut self.ctx[kind.idx()];
+        if ctx
             .our_source
             .as_ref()
             .is_some_and(|s| s.id() == source.id())
         {
-            self.our_source = None;
+            ctx.our_source = None;
         }
     }
 
-    /// Startup rule (§4.1), X11 half: if nothing came from the initial
-    /// Wayland roundtrip but a real X11 app owns CLIPBOARD, fill the
-    /// missing Wayland side.
+    /// Startup rule (§4.1), X11 half: fill only the missing side.
     pub fn probe_x11_startup(&mut self) {
-        if !matches!(self.broker.state(), broker::State::Idle) {
-            return;
-        }
-        match self.x11.selection_owner() {
-            Ok(owner) if owner != x11rb::NONE && owner != self.x11.win => {
-                info!("startup: X11 CLIPBOARD has an owner; filling the Wayland side");
-                self.dispatch_broker(broker::Event::X11Selection);
+        for kind in SelKind::ALL {
+            if kind == SelKind::Primary && !self.primary {
+                continue;
             }
-            Ok(_) => {}
-            Err(e) => self.fatal(e.context("startup X11 owner probe")),
+            if !matches!(self.ctx[kind.idx()].broker.state(), broker::State::Idle) {
+                continue;
+            }
+            match self.x11.selection_owner(kind) {
+                Ok(owner) if owner != x11rb::NONE && owner != self.x11.win => {
+                    info!(
+                        "startup: X11 {} has an owner; filling the Wayland side",
+                        kind.label()
+                    );
+                    self.dispatch_broker(kind, broker::Event::X11Selection);
+                }
+                Ok(_) => {}
+                Err(e) => self.fatal(e.context("startup X11 owner probe")),
+            }
         }
     }
 
-    // --- X11 side --------------------------------------------------------
+    // --- PRIMARY debounce (§14) --------------------------------------------
+
+    fn debounce_primary(&mut self, pending: PendingPrimary) {
+        self.pending_primary = Some(pending);
+        self.primary_gen += 1;
+        let generation = self.primary_gen;
+        if let Some(handle) = &self.loop_handle {
+            let timer = calloop::timer::Timer::from_duration(PRIMARY_DEBOUNCE);
+            let result = handle.insert_source(timer, move |_, (), app: &mut Self| {
+                app.fire_primary_debounce(generation);
+                calloop::timer::TimeoutAction::Drop
+            });
+            if result.is_err() {
+                // No timer — degrade to immediate processing.
+                self.fire_primary_debounce(generation);
+            }
+        } else {
+            self.fire_primary_debounce(generation);
+        }
+    }
+
+    fn fire_primary_debounce(&mut self, generation: u64) {
+        if generation != self.primary_gen {
+            return; // superseded by a newer change
+        }
+        match self.pending_primary.take() {
+            Some(PendingPrimary::Wayland(offer)) => {
+                self.process_wayland_selection(SelKind::Primary, offer);
+            }
+            Some(PendingPrimary::X11 { has_owner }) => {
+                if has_owner {
+                    self.dispatch_broker(SelKind::Primary, broker::Event::X11Selection);
+                } else if self.survives_source_exit(SelKind::Primary, true) {
+                    debug!("X11 source exited; serving PRIMARY from eager snapshot");
+                } else {
+                    self.dispatch_broker(SelKind::Primary, broker::Event::X11Cleared);
+                }
+            }
+            None => {}
+        }
+    }
+
+    // --- X11 side -----------------------------------------------------------
 
     pub fn drain_x11(&mut self) -> anyhow::Result<()> {
         while let Some(event) = self.x11.conn.poll_for_event()? {
@@ -170,49 +316,119 @@ impl App {
         Ok(())
     }
 
+    /// Eager survival (§4.2.1a): when the source app exits while we hold a
+    /// snapshot for this claim, keep the opposite-side proxy claim alive and
+    /// serve from memory instead of tearing everything down.
+    fn survives_source_exit(&self, kind: SelKind, source_state_is_x11: bool) -> bool {
+        if self.sync_mode != SyncMode::Eager {
+            return false;
+        }
+        let ctx = &self.ctx[kind.idx()];
+        if ctx.snapshot.is_none() {
+            return false;
+        }
+        match ctx.broker.state() {
+            broker::State::X11App { .. } => source_state_is_x11,
+            broker::State::WaylandApp { .. } => !source_state_is_x11,
+            _ => false,
+        }
+    }
+
+    fn kind_for_selection(&self, selection: Atom) -> Option<SelKind> {
+        if selection == self.x11.atoms.CLIPBOARD {
+            Some(SelKind::Clipboard)
+        } else if selection == Atom::from(AtomEnum::PRIMARY) && self.primary {
+            Some(SelKind::Primary)
+        } else {
+            None
+        }
+    }
+
     pub fn handle_x11_event(&mut self, event: &Event) {
         match event {
-            Event::SelectionClear(e) if e.selection == self.x11.atoms.CLIPBOARD => {
-                info!("lost X11 CLIPBOARD to a real X11 client");
-                self.x11.owned_since = None;
-                self.dispatch_broker(broker::Event::X11Lost);
+            Event::SelectionClear(e) => {
+                if let Some(kind) = self.kind_for_selection(e.selection) {
+                    info!("lost X11 {} to a real X11 client", kind.label());
+                    self.x11.owned_since[kind.idx()] = None;
+                    self.dispatch_broker(kind, broker::Event::X11Lost);
+                }
             }
             Event::SelectionRequest(req) => self.on_selection_request(*req),
-            Event::XfixesSelectionNotify(e) if e.selection == self.x11.atoms.CLIPBOARD => {
-                // Loop prevention by identity (§4.3), X11 side: our own
-                // claims echo back with owner == our window — skip them.
+            Event::XfixesSelectionNotify(e) => {
+                let Some(kind) = self.kind_for_selection(e.selection) else {
+                    return;
+                };
+                // Loop prevention by identity (§4.3), X11 side.
                 if e.owner == self.x11.win {
                     return;
                 }
-                if e.owner == x11rb::NONE {
-                    self.dispatch_broker(broker::Event::X11Cleared);
+                let has_owner = e.owner != x11rb::NONE
+                    && e.subtype == x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER;
+                if kind == SelKind::Primary {
+                    self.debounce_primary(PendingPrimary::X11 { has_owner });
+                    return;
+                }
+                if has_owner {
+                    debug!("X11 {} claimed by 0x{:x}", kind.label(), e.owner);
+                    self.dispatch_broker(kind, broker::Event::X11Selection);
+                } else if self.survives_source_exit(kind, true) {
+                    debug!(
+                        "X11 source exited; serving {} from eager snapshot",
+                        kind.label()
+                    );
                 } else {
-                    debug!("X11 CLIPBOARD claimed by 0x{:x}", e.owner);
-                    self.dispatch_broker(broker::Event::X11Selection);
+                    self.dispatch_broker(kind, broker::Event::X11Cleared);
                 }
             }
             // TARGETS reply for a FetchX11Targets command.
             Event::SelectionNotify(e)
                 if e.requestor == self.x11.win && e.target == self.x11.atoms.TARGETS =>
             {
-                let Some(epoch) = self.pending_targets_epoch.take() else {
+                let Some(kind) = self.kind_for_selection(e.selection) else {
                     return;
                 };
-                let mime_types = if e.property == x11rb::NONE {
-                    Vec::new() // owner refused TARGETS — nothing to bridge
-                } else {
-                    match self.x11.read_targets_property() {
-                        Ok(targets) => self.x11.targets_to_mimes(&targets),
-                        Err(err) => {
-                            debug!("reading TARGETS reply failed: {err:#}");
-                            Vec::new()
-                        }
-                    }
-                };
-                self.dispatch_broker(broker::Event::X11Targets { epoch, mime_types });
+                self.on_targets_reply(kind, e.property);
             }
             _ => {}
         }
+    }
+
+    fn on_targets_reply(&mut self, kind: SelKind, property: Atom) {
+        let Some(epoch) = self.ctx[kind.idx()].pending_targets_epoch.take() else {
+            return;
+        };
+        let mut mime_types = Vec::new();
+        if property != x11rb::NONE {
+            match self.x11.read_targets_property(kind) {
+                Ok(targets) => {
+                    let names = self.x11.target_names(&targets);
+                    let sensitive = mime::is_sensitive(&names);
+                    self.ctx[kind.idx()].sensitive = sensitive;
+                    if sensitive {
+                        if self.skip_sensitive {
+                            info!("[sensitive] X11 offer skipped (--skip-sensitive)");
+                            self.dispatch_broker(
+                                kind,
+                                broker::Event::X11Targets {
+                                    epoch,
+                                    mime_types: Vec::new(),
+                                },
+                            );
+                            return;
+                        }
+                        info!("[sensitive] X11 selection changed on {}", kind.label());
+                    }
+                    let (advertised, plans) = mime::x2w_translate(&names);
+                    self.ctx[kind.idx()].x2w_plans = plans
+                        .into_iter()
+                        .map(|(mime, target, transform)| (mime, (target, transform)))
+                        .collect();
+                    mime_types = advertised;
+                }
+                Err(err) => debug!("reading TARGETS reply failed: {err:#}"),
+            }
+        }
+        self.dispatch_broker(kind, broker::Event::X11Targets { epoch, mime_types });
     }
 
     fn on_selection_request(&mut self, req: SelectionRequestEvent) {
@@ -225,17 +441,17 @@ impl App {
             req.property
         };
 
-        let Some(owned_since) = self.x11.owned_since else {
+        let Some(kind) = self.kind_for_selection(req.selection) else {
             transfer::notify(&self.x11.conn, &req, None);
             return;
         };
-        if req.selection != atoms.CLIPBOARD {
+        let Some(owned_since) = self.x11.owned_since[kind.idx()] else {
             transfer::notify(&self.x11.conn, &req, None);
             return;
-        }
+        };
 
         let string_atom = Atom::from(AtomEnum::STRING);
-        let has_text = match self.broker.state() {
+        let has_text = match self.ctx[kind.idx()].broker.state() {
             broker::State::WaylandApp { mime_types } => mime::pick_text(mime_types).is_some(),
             _ => false,
         };
@@ -244,7 +460,7 @@ impl App {
             if has_text {
                 targets.extend([atoms.UTF8_STRING, atoms.TEXT, string_atom]);
             }
-            targets.extend(self.proxy_targets.keys().copied());
+            targets.extend(self.ctx[kind.idx()].proxy_targets.keys().copied());
             self.reply_atoms(&req, property, AtomEnum::ATOM, &targets);
         } else if req.target == atoms.TIMESTAMP {
             self.reply_atoms(&req, property, AtomEnum::INTEGER, &[owned_since]);
@@ -260,11 +476,34 @@ impl App {
             || req.target == string_atom)
             && has_text
         {
-            self.start_text_paste(req, property);
-        } else if let Some(mime) = self.proxy_targets.get(&req.target).cloned() {
-            // §7 pass-through: serve the offered MIME verbatim under its
-            // own atom.
-            self.start_paste(req, property, &mime, req.target, Conv::None);
+            let Some(mime) = self.ctx[kind.idx()]
+                .current_offer
+                .as_ref()
+                .and_then(|o| mime::pick_text(&o.mime_types()))
+            else {
+                transfer::notify(&self.x11.conn, &req, None);
+                return;
+            };
+            let to_latin1 = req.target == string_atom;
+            let (reply_type, conversion) = if to_latin1 {
+                (string_atom, Conv::Utf8ToLatin1)
+            } else {
+                (atoms.UTF8_STRING, Conv::None)
+            };
+            self.start_paste(
+                kind,
+                req,
+                property,
+                mime.to_owned(),
+                reply_type,
+                conversion,
+                Transform::None,
+            );
+        } else if let Some((mime, transform)) =
+            self.ctx[kind.idx()].proxy_targets.get(&req.target).cloned()
+        {
+            // §7 pass-through / synthesized targets.
+            self.start_paste(kind, req, property, mime, req.target, Conv::None, transform);
         } else {
             debug!("refusing unadvertised target atom {}", req.target);
             transfer::notify(&self.x11.conn, &req, None);
@@ -296,33 +535,33 @@ impl App {
         transfer::notify(&self.x11.conn, req, ok.then_some(property));
     }
 
-    fn start_text_paste(&mut self, req: SelectionRequestEvent, property: Atom) {
-        let Some(mime) = self
-            .current_offer
-            .as_ref()
-            .and_then(|o| mime::pick_text(&o.mime_types()))
-        else {
-            transfer::notify(&self.x11.conn, &req, None);
-            return;
-        };
-        let to_latin1 = req.target == Atom::from(AtomEnum::STRING);
-        let (reply_type, conversion) = if to_latin1 {
-            (Atom::from(AtomEnum::STRING), Conv::Utf8ToLatin1)
-        } else {
-            (self.x11.atoms.UTF8_STRING, Conv::None)
-        };
-        self.start_paste(req, property, mime, reply_type, conversion);
-    }
-
+    #[allow(clippy::too_many_arguments)] // paste context is genuinely this wide
     fn start_paste(
         &mut self,
+        kind: SelKind,
         req: SelectionRequestEvent,
         property: Atom,
-        mime: &str,
+        mime: String,
         reply_type: Atom,
         conversion: Conv,
+        transform: Transform,
     ) {
-        let Some(offer) = self.current_offer.clone() else {
+        let reply = PasteReply {
+            req,
+            property,
+            reply_type,
+            conversion,
+            transform,
+            timeout: self.transfer_timeout,
+        };
+        // Eager (§4.2.1): serve from the snapshot when this type made it in.
+        if let Some(snapshot) = &self.ctx[kind.idx()].snapshot
+            && snapshot.data.contains_key(&mime)
+        {
+            transfer::spawn_snapshot_serve(reply, snapshot.clone(), mime);
+            return;
+        }
+        let Some(offer) = self.ctx[kind.idx()].current_offer.clone() else {
             transfer::notify(&self.x11.conn, &req, None);
             return;
         };
@@ -336,91 +575,206 @@ impl App {
         };
         // Lazy proxying (§4.2): this is the moment payload bytes start
         // moving — an actual paste, never before.
-        offer.receive(mime, std::os::fd::AsFd::as_fd(&writer));
+        offer.receive(&mime, std::os::fd::AsFd::as_fd(&writer));
         drop(writer);
         if let Err(e) = self.wl_conn.flush() {
             self.fatal(anyhow!(e).context("flush Wayland after receive"));
             return;
         }
-        transfer::spawn_wayland_read(
-            PasteReply {
-                req,
-                property,
-                reply_type,
-                conversion,
-                timeout: self.transfer_timeout,
-            },
-            reader,
-        );
+        transfer::spawn_wayland_read(reply, reader);
     }
 
-    // --- Broker plumbing -------------------------------------------------
+    // --- Eager snapshots (§4.2.1) -------------------------------------------
 
-    fn dispatch_broker(&mut self, event: broker::Event) {
-        for command in self.broker.handle(event) {
-            self.run_command(&command);
+    /// Kick off an eager fetch of every bridgeable type for the current
+    /// claim. Data lands back on the event loop via the snapshot channel.
+    fn start_eager_fetch(&mut self, kind: SelKind, mimes: &[String]) {
+        if self.sync_mode != SyncMode::Eager {
+            return;
+        }
+        let Some(tx) = self.snapshot_tx.clone() else {
+            return;
+        };
+        let epoch = self.ctx[kind.idx()].broker.epoch();
+        let cap = self.eager_max;
+        let timeout = self.transfer_timeout;
+        match self.ctx[kind.idx()].broker.state() {
+            broker::State::WaylandApp { .. } => {
+                // W-side owner: receive() every type into pipes now, collect
+                // on a thread.
+                let Some(offer) = self.ctx[kind.idx()].current_offer.clone() else {
+                    return;
+                };
+                let mut pipes = Vec::new();
+                for mime in mimes {
+                    match std::io::pipe() {
+                        Ok((reader, writer)) => {
+                            offer.receive(mime, std::os::fd::AsFd::as_fd(&writer));
+                            drop(writer);
+                            pipes.push((mime.clone(), reader));
+                        }
+                        Err(e) => error!("pipe() for eager fetch failed: {e}"),
+                    }
+                }
+                if let Err(e) = self.wl_conn.flush() {
+                    self.fatal(anyhow!(e).context("flush Wayland after eager receive"));
+                    return;
+                }
+                std::thread::spawn(move || {
+                    collect_snapshot(kind, epoch, pipes, cap, timeout, &tx);
+                });
+            }
+            broker::State::X11App { .. } => {
+                // X-side owner: run one lazy read per type into pipes, then
+                // collect. spawn_x11_read serializes via the X→W gate.
+                let mut pipes = Vec::new();
+                for mime in mimes {
+                    match std::io::pipe() {
+                        Ok((reader, writer)) => {
+                            let plan = self.ctx[kind.idx()].x2w_plans.get(mime).cloned();
+                            transfer::spawn_x11_read(X2wRequest {
+                                mime: mime.clone(),
+                                plan,
+                                kind,
+                                fd: writer.into(),
+                                timeout,
+                            });
+                            pipes.push((mime.clone(), reader));
+                        }
+                        Err(e) => error!("pipe() for eager fetch failed: {e}"),
+                    }
+                }
+                std::thread::spawn(move || {
+                    collect_snapshot(kind, epoch, pipes, cap, timeout, &tx);
+                });
+            }
+            _ => {}
         }
     }
 
-    fn run_command(&mut self, command: &Command) {
+    /// Snapshot fetch finished: adopt it if it still matches the epoch.
+    pub fn on_snapshot(&mut self, msg: SnapshotMsg) {
+        let ctx = &mut self.ctx[msg.kind.idx()];
+        if msg.snapshot.epoch != ctx.broker.epoch() {
+            return; // superseded claim; ropes zero on drop
+        }
+        if !msg.snapshot.lock_in_memory() {
+            debug!("eager snapshot partially mlocked (RLIMIT_MEMLOCK); continuing");
+        }
+        let types = msg.snapshot.data.len();
+        ctx.snapshot = Some(Arc::new(msg.snapshot));
+        if ctx.sensitive {
+            info!("[sensitive] eager snapshot ready");
+        } else {
+            debug!("eager snapshot ready: {types} types");
+        }
+    }
+
+    // --- Broker plumbing ------------------------------------------------------
+
+    fn dispatch_broker(&mut self, kind: SelKind, event: broker::Event) {
+        let before = self.ctx[kind.idx()].broker.epoch();
+        let commands = self.ctx[kind.idx()].broker.handle(event);
+        if self.ctx[kind.idx()].broker.epoch() != before {
+            // Every legitimate ownership change invalidates the snapshot;
+            // a fresh one arrives after the new claim (§4.2.1).
+            self.ctx[kind.idx()].snapshot = None;
+        }
+        for command in commands {
+            self.run_command(kind, &command);
+        }
+    }
+
+    fn run_command(&mut self, kind: SelKind, command: &Command) {
         match command {
             Command::ClaimX11 { .. } => {
-                self.proxy_targets = match self.broker.state() {
+                let (map, mimes) = match self.ctx[kind.idx()].broker.state() {
                     broker::State::WaylandApp { mime_types } => {
-                        match self.x11.intern_mimes(mime_types) {
-                            Ok(map) => map,
+                        let mut map = match self.x11.intern_mimes(mime_types) {
+                            Ok(map) => map
+                                .into_iter()
+                                .map(|(atom, mime)| (atom, (mime, Transform::None)))
+                                .collect::<HashMap<_, _>>(),
                             Err(e) => {
                                 self.fatal(e.context("intern offer MIME atoms"));
                                 return;
                             }
+                        };
+                        // §7 synthesized targets (gnome-copied-files).
+                        for (target, source_mime, transform) in
+                            mime::synthesized_x11_targets(mime_types)
+                        {
+                            match self.x11.intern_mimes(std::slice::from_ref(&target)) {
+                                Ok(extra) => {
+                                    for (atom, _) in extra {
+                                        map.insert(atom, (source_mime.clone(), transform));
+                                    }
+                                }
+                                Err(e) => {
+                                    self.fatal(e.context("intern synthesized target"));
+                                    return;
+                                }
+                            }
                         }
+                        (map, mime_types.clone())
                     }
-                    _ => HashMap::new(),
+                    _ => (HashMap::new(), Vec::new()),
                 };
-                match self.x11.claim() {
+                self.ctx[kind.idx()].proxy_targets = map;
+                match self.x11.claim(kind) {
                     Ok(pending) => {
                         for event in pending {
                             self.handle_x11_event(&event);
                         }
+                        self.start_eager_fetch(kind, &mimes);
                     }
                     Err(e) => self.fatal(e.context("claim X11 selection")),
                 }
             }
             Command::ReleaseX11 => {
-                self.proxy_targets.clear();
-                if let Err(e) = self.x11.release() {
+                self.ctx[kind.idx()].proxy_targets.clear();
+                if let Err(e) = self.x11.release(kind) {
                     self.fatal(e.context("release X11 selection"));
                 }
             }
             Command::FetchX11Targets { epoch } => {
-                self.pending_targets_epoch = Some(*epoch);
-                if let Err(e) = self.x11.fetch_targets() {
+                self.ctx[kind.idx()].pending_targets_epoch = Some(*epoch);
+                if let Err(e) = self.x11.fetch_targets(kind) {
                     self.fatal(e.context("fetch X11 TARGETS"));
                 }
             }
             Command::ClaimWayland { mime_types, .. } => {
                 // Replacing our own claim: drop the old source now; its
                 // Cancelled event dies with the destroyed proxy.
-                if let Some(old) = self.our_source.take() {
+                if let Some(old) = self.ctx[kind.idx()].our_source.take() {
                     old.destroy();
                 }
-                let source = self.manager.create_source(mime_types, &self.qh);
-                self.device.set_selection(Some(&source));
-                self.our_source = Some(source);
+                let source = self.manager.create_source(mime_types, kind, &self.qh);
+                self.device.set_selection(kind, Some(&source));
+                self.ctx[kind.idx()].our_source = Some(source);
                 if let Err(e) = self.wl_conn.flush() {
                     self.fatal(anyhow!(e).context("flush Wayland after claim"));
                 } else {
-                    info!("claimed Wayland selection (proxying X11 owner)");
+                    if self.ctx[kind.idx()].sensitive {
+                        info!(
+                            "[sensitive] claimed Wayland {} (proxying X11)",
+                            kind.label()
+                        );
+                    } else {
+                        info!("claimed Wayland {} (proxying X11 owner)", kind.label());
+                    }
+                    let mimes = mime_types.clone();
+                    self.start_eager_fetch(kind, &mimes);
                 }
             }
             Command::ReleaseWayland => {
-                if let Some(source) = self.our_source.take() {
-                    self.device.set_selection(None);
+                if let Some(source) = self.ctx[kind.idx()].our_source.take() {
+                    self.device.set_selection(kind, None);
                     source.destroy();
                     if let Err(e) = self.wl_conn.flush() {
                         self.fatal(anyhow!(e).context("flush Wayland after release"));
                     } else {
-                        info!("released Wayland selection");
+                        info!("released Wayland {}", kind.label());
                     }
                 }
             }
@@ -436,4 +790,35 @@ impl App {
             signal.stop();
         }
     }
+}
+
+/// Read each eager pipe to EOF (bounded by `cap` per type) and deliver the
+/// snapshot back to the event loop. Over-cap or failed types are skipped —
+/// they degrade to lazy (§4.2.1).
+fn collect_snapshot(
+    kind: SelKind,
+    epoch: u64,
+    pipes: Vec<(String, std::io::PipeReader)>,
+    cap: Option<usize>,
+    _timeout: Option<Duration>,
+    tx: &calloop::channel::Sender<SnapshotMsg>,
+) {
+    let mut data = HashMap::new();
+    for (mime, mut reader) in pipes {
+        match PayloadRope::read_to_end(&mut reader, cap) {
+            Ok(ReadOutcome::Complete(rope)) => {
+                if !rope.is_empty() {
+                    data.insert(mime, rope);
+                }
+            }
+            Ok(ReadOutcome::Overflow(_)) => {
+                debug!("eager: {mime} exceeds --eager-max-size; degrading to lazy");
+            }
+            Err(e) => debug!("eager fetch of {mime} failed: {e}"),
+        }
+    }
+    let _ = tx.send(SnapshotMsg {
+        kind,
+        snapshot: Snapshot { epoch, data },
+    });
 }

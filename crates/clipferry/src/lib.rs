@@ -14,6 +14,33 @@ pub mod transfer;
 pub mod wayland;
 pub mod x11;
 
+/// Which selection a piece of state belongs to. PRIMARY is opt-in (§3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelKind {
+    Clipboard,
+    Primary,
+}
+
+impl SelKind {
+    pub const ALL: [Self; 2] = [Self::Clipboard, Self::Primary];
+
+    #[must_use]
+    pub const fn idx(self) -> usize {
+        match self {
+            Self::Clipboard => 0,
+            Self::Primary => 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Clipboard => "CLIPBOARD",
+            Self::Primary => "PRIMARY",
+        }
+    }
+}
+
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- M4: §7 translation table (gnome-copied-files ⇄ uri-list synthesis, Qt
+  image quirk), `--sync-mode eager` with `--eager-max-size` (snapshots
+  survive source exit, over-cap types degrade to lazy, best-effort mlock),
+  `--primary` with 50 ms debounce, `--skip-sensitive` with KDE password
+  hint detection; Codecov made informational.
 - M3: all MIME types bridged verbatim (§7 pass-through) with INCR in both
   directions; `--transfer-timeout` idle timeout (default: none); X→W reads
   serialized and INCR-drained for single-threaded X11 owners.

@@ -4,7 +4,9 @@
 //! that are never reallocated — a growing `Vec` would return its old blocks
 //! to the allocator un-zeroed.
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
@@ -83,6 +85,80 @@ impl PayloadRope {
             out.extend_from_slice(chunk);
         }
         out
+    }
+}
+
+/// An eager-mode snapshot (§4.2.1): one rope per advertised MIME type,
+/// tagged with the claim epoch it belongs to. Held in memory only; replaced
+/// on the next claim; ropes zero on drop.
+pub struct Snapshot {
+    pub epoch: u64,
+    pub data: HashMap<String, PayloadRope>,
+}
+
+impl Snapshot {
+    /// Best-effort §8.1 mlock of every payload chunk (keeps snapshots out
+    /// of swap). Degrades silently past `RLIMIT_MEMLOCK`; core-dump
+    /// exposure is separately closed by `PR_SET_DUMPABLE=0` (M5).
+    #[allow(unsafe_code)] // sole unsafe in the crate; see SAFETY below
+    pub fn lock_in_memory(&self) -> bool {
+        let mut all_locked = true;
+        for rope in self.data.values() {
+            for chunk in &rope.chunks {
+                // SAFETY: the chunk allocation is live for the duration of
+                // the call; mlock does not move or mutate memory.
+                let ok = unsafe {
+                    rustix::mm::mlock(chunk.as_ptr().cast_mut().cast(), chunk.len()).is_ok()
+                };
+                if !ok {
+                    all_locked = false;
+                }
+            }
+        }
+        all_locked
+    }
+}
+
+/// `Read` over one MIME's rope inside a shared snapshot — lets eager-mode
+/// serving reuse the exact same streaming code as lazy pipes.
+pub struct SnapshotReader {
+    snapshot: Arc<Snapshot>,
+    mime: String,
+    chunk: usize,
+    offset: usize,
+}
+
+impl SnapshotReader {
+    #[must_use]
+    pub const fn new(snapshot: Arc<Snapshot>, mime: String) -> Self {
+        Self {
+            snapshot,
+            mime,
+            chunk: 0,
+            offset: 0,
+        }
+    }
+}
+
+impl Read for SnapshotReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(rope) = self.snapshot.data.get(&self.mime) else {
+            return Ok(0);
+        };
+        loop {
+            let Some(chunk) = rope.chunks.get(self.chunk) else {
+                return Ok(0);
+            };
+            if self.offset >= chunk.len() {
+                self.chunk += 1;
+                self.offset = 0;
+                continue;
+            }
+            let n = (chunk.len() - self.offset).min(buf.len());
+            buf[..n].copy_from_slice(&chunk[self.offset..self.offset + n]);
+            self.offset += n;
+            return Ok(n);
+        }
     }
 }
 
