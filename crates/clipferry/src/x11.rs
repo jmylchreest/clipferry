@@ -223,23 +223,54 @@ impl X11 {
         Ok(reply.value32().map(Iterator::collect).unwrap_or_default())
     }
 
-    /// M2: translate the owner's target atoms to the Wayland MIME types we
-    /// can proxy (text only until M3).
+    /// Translate the owner's target atoms into Wayland MIME types (§7):
+    /// plain text collapses into the standard text set, protocol atoms are
+    /// dropped, everything else passes through under its atom name verbatim.
     pub fn targets_to_mimes(&self, targets: &[x11rb::protocol::xproto::Atom]) -> Vec<String> {
-        let text_atoms = [
-            self.atoms.UTF8_STRING,
-            self.atoms.TEXT,
-            self.atoms.TEXT_PLAIN,
-            self.atoms.TEXT_PLAIN_UTF8,
-            x11rb::protocol::xproto::Atom::from(AtomEnum::STRING),
-        ];
-        if targets.iter().any(|t| text_atoms.contains(t)) {
-            crate::mime::X2W_TEXT_MIMES
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect()
-        } else {
-            Vec::new()
+        let cookies: Vec<_> = targets
+            .iter()
+            .map(|&a| self.conn.get_atom_name(a))
+            .collect();
+        let mut passthrough: Vec<String> = Vec::new();
+        let mut has_text = false;
+        for cookie in cookies {
+            let Ok(cookie) = cookie else { continue };
+            let Ok(reply) = cookie.reply() else { continue };
+            let name = String::from_utf8_lossy(&reply.name).into_owned();
+            if crate::mime::PROTOCOL_TARGETS.contains(&name.as_str()) {
+                continue;
+            }
+            if crate::mime::is_plain_text(&name) {
+                has_text = true;
+                continue;
+            }
+            if !passthrough.contains(&name) {
+                passthrough.push(name);
+            }
         }
+        let mut mimes: Vec<String> = Vec::new();
+        if has_text {
+            mimes.extend(crate::mime::X2W_TEXT_MIMES.iter().map(|s| (*s).to_owned()));
+        }
+        mimes.extend(passthrough);
+        mimes
+    }
+
+    /// Intern atoms for the MIME types we advertise as X11 targets when
+    /// proxying W→X. Legacy text names are covered by the alias targets.
+    pub fn intern_mimes(
+        &self,
+        mimes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<x11rb::protocol::xproto::Atom, String>> {
+        let cookies: Vec<_> = mimes
+            .iter()
+            .filter(|m| !matches!(m.as_str(), "UTF8_STRING" | "TEXT" | "STRING"))
+            .map(|m| (m.clone(), self.conn.intern_atom(false, m.as_bytes())))
+            .collect();
+        let mut map = std::collections::HashMap::new();
+        for (mime, cookie) in cookies {
+            map.insert(cookie?.reply()?.atom, mime);
+        }
+        Ok(map)
     }
 }

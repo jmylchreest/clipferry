@@ -19,10 +19,12 @@ pub struct PayloadRope {
 }
 
 pub enum ReadOutcome {
+    /// EOF reached within the cap.
     Complete(PayloadRope),
-    /// The running total crossed `cap`; whatever was buffered is dropped
-    /// (and thereby zeroed) with this value.
-    CapExceeded,
+    /// The running total crossed `cap`. The rope holds what was read so
+    /// far (at most cap + one chunk); more remains in the reader. Callers
+    /// either continue streaming (INCR) or drop it (zeroed on drop).
+    Overflow(PayloadRope),
 }
 
 impl PayloadRope {
@@ -58,13 +60,18 @@ impl PayloadRope {
             rope.len += filled;
             rope.chunks.push(chunk);
             if cap.is_some_and(|c| rope.len > c) {
-                return Ok(ReadOutcome::CapExceeded);
+                return Ok(ReadOutcome::Overflow(rope));
             }
             if filled < CHUNK_SIZE {
                 break;
             }
         }
         Ok(ReadOutcome::Complete(rope))
+    }
+
+    /// Iterate the chunks in order (for INCR-style chunked serving).
+    pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(|c| c.as_slice())
     }
 
     /// The one sanctioned contiguous copy (§8.1): an X11 non-INCR
@@ -133,10 +140,10 @@ mod tests {
     #[test]
     fn cap_is_enforced_while_streaming() {
         let data = vec![1_u8; CHUNK_SIZE * 3];
-        assert!(matches!(
-            read_all(&data, Some(CHUNK_SIZE + 1)),
-            ReadOutcome::CapExceeded
-        ));
+        let ReadOutcome::Overflow(partial) = read_all(&data, Some(CHUNK_SIZE + 1)) else {
+            panic!("expected Overflow");
+        };
+        assert!(partial.len() > CHUNK_SIZE && partial.len() <= CHUNK_SIZE * 2);
         // At exactly the cap the payload is allowed through.
         let data = vec![1_u8; CHUNK_SIZE];
         assert!(matches!(

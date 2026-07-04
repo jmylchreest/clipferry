@@ -9,10 +9,13 @@ use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{Atom, AtomEnum, SelectionRequestEvent};
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use wayland_client::QueueHandle;
 
 use crate::broker::{Broker, Command};
-use crate::transfer::{self, PasteReply};
+use crate::transfer::{self, Conv, PasteReply};
 use crate::wayland::{Device, Manager, Offer, Source};
 use crate::x11::X11;
 use crate::{broker, mime};
@@ -31,17 +34,23 @@ pub struct App {
     pub our_source: Option<Source>,
     /// Epoch of the in-flight TARGETS fetch, if any (§4.3 staleness guard).
     pending_targets_epoch: Option<u64>,
+    /// Atom → MIME map for our current W→X proxy claim: the arbitrary
+    /// targets we advertise on X11 beyond the text aliases (§7 pass-through).
+    proxy_targets: HashMap<Atom, String>,
+    /// §4.2 idle timeout for payload transfers; `None` = infinite (default).
+    pub transfer_timeout: Option<Duration>,
     pub exit: Option<anyhow::Error>,
     pub loop_signal: Option<LoopSignal>,
 }
 
 impl App {
-    pub const fn new(
+    pub fn new(
         x11: X11,
         wl_conn: wayland_client::Connection,
         manager: Manager,
         device: Device,
         qh: QueueHandle<Self>,
+        transfer_timeout: Option<Duration>,
     ) -> Self {
         Self {
             broker: Broker::new(),
@@ -53,6 +62,8 @@ impl App {
             current_offer: None,
             our_source: None,
             pending_targets_epoch: None,
+            proxy_targets: HashMap::new(),
+            transfer_timeout,
             exit: None,
             loop_signal: None,
         }
@@ -80,13 +91,18 @@ impl App {
                 mime_types.len()
             );
             self.current_offer = Some(offer);
-            let event = if mime::pick_text(&mime_types).is_some() {
-                broker::Event::WaylandSelection { mime_types }
-            } else {
-                // M1 bridges text only; a non-text owner means we have
-                // nothing to proxy, which is the same as a clear.
-                debug!("no text type in offer (all-MIME bridging is M3); standing down");
+            // §7: bridge everything except X11 protocol machinery names.
+            let bridgeable: Vec<String> = mime_types
+                .into_iter()
+                .filter(|m| !mime::PROTOCOL_TARGETS.contains(&m.as_str()))
+                .collect();
+            let event = if bridgeable.is_empty() {
+                debug!("offer has no bridgeable types; standing down");
                 broker::Event::WaylandCleared
+            } else {
+                broker::Event::WaylandSelection {
+                    mime_types: bridgeable,
+                }
             };
             self.dispatch_broker(event);
         } else {
@@ -112,7 +128,7 @@ impl App {
             debug!("send request on a superseded source; dropping (empty paste)");
             return; // dropping fd closes the pipe → empty paste
         }
-        transfer::spawn_x11_read(mime.to_owned(), fd);
+        transfer::spawn_x11_read(mime.to_owned(), fd, self.transfer_timeout);
     }
 
     /// The compositor cancelled a source of ours (someone else claimed, or
@@ -219,14 +235,16 @@ impl App {
         }
 
         let string_atom = Atom::from(AtomEnum::STRING);
+        let has_text = match self.broker.state() {
+            broker::State::WaylandApp { mime_types } => mime::pick_text(mime_types).is_some(),
+            _ => false,
+        };
         if req.target == atoms.TARGETS {
-            let targets = [
-                atoms.TARGETS,
-                atoms.TIMESTAMP,
-                atoms.UTF8_STRING,
-                atoms.TEXT,
-                string_atom,
-            ];
+            let mut targets = vec![atoms.TARGETS, atoms.TIMESTAMP];
+            if has_text {
+                targets.extend([atoms.UTF8_STRING, atoms.TEXT, string_atom]);
+            }
+            targets.extend(self.proxy_targets.keys().copied());
             self.reply_atoms(&req, property, AtomEnum::ATOM, &targets);
         } else if req.target == atoms.TIMESTAMP {
             self.reply_atoms(&req, property, AtomEnum::INTEGER, &[owned_since]);
@@ -237,16 +255,18 @@ impl App {
                 req.requestor
             );
             transfer::notify(&self.x11.conn, &req, None);
-        } else if req.target == atoms.UTF8_STRING
+        } else if (req.target == atoms.UTF8_STRING
             || req.target == atoms.TEXT
-            || req.target == string_atom
+            || req.target == string_atom)
+            && has_text
         {
             self.start_text_paste(req, property);
+        } else if let Some(mime) = self.proxy_targets.get(&req.target).cloned() {
+            // §7 pass-through: serve the offered MIME verbatim under its
+            // own atom.
+            self.start_paste(req, property, &mime, req.target, Conv::None);
         } else {
-            debug!(
-                "refusing target atom {} (all-MIME passthrough is M3)",
-                req.target
-            );
+            debug!("refusing unadvertised target atom {}", req.target);
             transfer::notify(&self.x11.conn, &req, None);
         }
         if let Err(e) = self.x11.conn.flush() {
@@ -277,11 +297,32 @@ impl App {
     }
 
     fn start_text_paste(&mut self, req: SelectionRequestEvent, property: Atom) {
-        let Some(offer) = self.current_offer.clone() else {
+        let Some(mime) = self
+            .current_offer
+            .as_ref()
+            .and_then(|o| mime::pick_text(&o.mime_types()))
+        else {
             transfer::notify(&self.x11.conn, &req, None);
             return;
         };
-        let Some(mime) = mime::pick_text(&offer.mime_types()) else {
+        let to_latin1 = req.target == Atom::from(AtomEnum::STRING);
+        let (reply_type, conversion) = if to_latin1 {
+            (Atom::from(AtomEnum::STRING), Conv::Utf8ToLatin1)
+        } else {
+            (self.x11.atoms.UTF8_STRING, Conv::None)
+        };
+        self.start_paste(req, property, mime, reply_type, conversion);
+    }
+
+    fn start_paste(
+        &mut self,
+        req: SelectionRequestEvent,
+        property: Atom,
+        mime: &str,
+        reply_type: Atom,
+        conversion: Conv,
+    ) {
+        let Some(offer) = self.current_offer.clone() else {
             transfer::notify(&self.x11.conn, &req, None);
             return;
         };
@@ -301,20 +342,13 @@ impl App {
             self.fatal(anyhow!(e).context("flush Wayland after receive"));
             return;
         }
-        let to_latin1 = req.target == Atom::from(AtomEnum::STRING);
-        let reply_type = if to_latin1 {
-            Atom::from(AtomEnum::STRING)
-        } else {
-            self.x11.atoms.UTF8_STRING
-        };
-        transfer::spawn_text_paste(
+        transfer::spawn_wayland_read(
             PasteReply {
-                conn: self.x11.conn.clone(),
                 req,
                 property,
                 reply_type,
-                to_latin1,
-                max_payload: self.x11.max_payload,
+                conversion,
+                timeout: self.transfer_timeout,
             },
             reader,
         );
@@ -330,15 +364,30 @@ impl App {
 
     fn run_command(&mut self, command: &Command) {
         match command {
-            Command::ClaimX11 { .. } => match self.x11.claim() {
-                Ok(pending) => {
-                    for event in pending {
-                        self.handle_x11_event(&event);
+            Command::ClaimX11 { .. } => {
+                self.proxy_targets = match self.broker.state() {
+                    broker::State::WaylandApp { mime_types } => {
+                        match self.x11.intern_mimes(mime_types) {
+                            Ok(map) => map,
+                            Err(e) => {
+                                self.fatal(e.context("intern offer MIME atoms"));
+                                return;
+                            }
+                        }
                     }
+                    _ => HashMap::new(),
+                };
+                match self.x11.claim() {
+                    Ok(pending) => {
+                        for event in pending {
+                            self.handle_x11_event(&event);
+                        }
+                    }
+                    Err(e) => self.fatal(e.context("claim X11 selection")),
                 }
-                Err(e) => self.fatal(e.context("claim X11 selection")),
-            },
+            }
             Command::ReleaseX11 => {
+                self.proxy_targets.clear();
                 if let Err(e) = self.x11.release() {
                     self.fatal(e.context("release X11 selection"));
                 }

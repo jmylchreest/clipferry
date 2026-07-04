@@ -20,6 +20,30 @@ pub const X2W_TEXT_MIMES: &[&str] = &[
     "STRING",
 ];
 
+/// X11 protocol machinery atoms — never forwarded as content types (§7).
+pub const PROTOCOL_TARGETS: &[&str] = &[
+    "TARGETS",
+    "TIMESTAMP",
+    "MULTIPLE",
+    "SAVE_TARGETS",
+    "DELETE",
+    "INCR",
+];
+
+/// Plain-text targets/MIMEs that collapse into the standard text set when
+/// translating. (`text/html` etc. are NOT plain text — they pass verbatim.)
+pub fn is_plain_text(name: &str) -> bool {
+    matches!(
+        name,
+        "UTF8_STRING"
+            | "STRING"
+            | "TEXT"
+            | "text/plain"
+            | "text/plain;charset=utf-8"
+            | "text/plain;charset=UTF-8"
+    )
+}
+
 pub fn pick_text(mime_types: &[String]) -> Option<&'static str> {
     TEXT_MIMES
         .iter()

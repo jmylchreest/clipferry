@@ -85,7 +85,9 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     }
 
     let device = manager.get_data_device(&seat, &qh);
-    let mut app = App::new(x, wl_conn.clone(), manager, device, qh);
+    let timeout = (options.transfer_timeout > 0)
+        .then(|| std::time::Duration::from_secs(options.transfer_timeout));
+    let mut app = App::new(x, wl_conn.clone(), manager, device, qh, timeout);
 
     // Startup rule (§4.1): the roundtrip delivers the current Wayland
     // selection (if any); the probe fills the Wayland side if only X11 has
@@ -112,7 +114,7 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow!("insert X11 source: {e}"))?;
 
-    info!("bridging CLIPBOARD (text, bidirectional)");
+    info!("bridging CLIPBOARD (all MIME types, bidirectional)");
     event_loop
         .run(None, &mut app, |_| {})
         .context("event loop")?;

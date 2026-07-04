@@ -46,7 +46,7 @@ Continuous builds from `main` are published to the [snapshot release](https://gi
 
 - [x] **M1** — text, one direction (Wayland → X11); proves the lazy proxy model
 - [x] **M2** — bidirectional text, ownership-based loop prevention, epoch counter
-- [ ] **M3** — all-MIME passthrough + INCR in both directions (10 MB PNG test)
+- [x] **M3** — all-MIME passthrough + INCR in both directions (10 MB PNG test)
 - [ ] **M4** — translation table, `--sync-mode eager`, `--primary`, `--skip-sensitive`
 - [ ] **M5** — Landlock self-sandbox, systemd unit, AUR + crates.io packaging
 
