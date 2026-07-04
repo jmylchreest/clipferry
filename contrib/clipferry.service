@@ -2,6 +2,8 @@
 Description=clipferry — X11 <-> Wayland clipboard bridge
 After=graphical-session.target
 PartOf=graphical-session.target
+# Crash-only design (DESIGN.md §4.4): never give up, back off exponentially.
+StartLimitIntervalSec=0
 # Only needed on satellite-style compositors; gate per-session with a user
 # drop-in (~/.config/systemd/user/clipferry.service.d/*.conf), e.g.:
 #   ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
@@ -11,6 +13,8 @@ Type=simple
 ExecStart=/usr/bin/clipferry
 Restart=always
 RestartSec=1
+RestartSteps=5
+RestartMaxDelaySec=30
 # Hardening — the daemon needs only the two display sockets and stderr:
 ProtectSystem=strict
 ProtectHome=read-only
