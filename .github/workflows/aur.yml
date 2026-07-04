@@ -1,0 +1,57 @@
+# Publishes PKGBUILDs to the AUR when a real (non-prerelease) release lands.
+# Gated on the AUR_PUBLISH repository *variable* (secrets are not readable in
+# job-level `if`): set it to "true" once the deploy key's public half is
+# registered on the AUR account. Secrets used: AUR_USERNAME, AUR_EMAIL,
+# AUR_SSH_PRIVATE_KEY.
+name: AUR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    name: publish PKGBUILDs
+    if: vars.AUR_PUBLISH == 'true' && (github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Pin PKGBUILD to the released version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # workflow_dispatch: use the latest tag instead.
+          if [ -z "$TAG" ]; then
+            TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            [ -n "$TAG" ] || { echo "no release tag found"; exit 1; }
+          fi
+          version="${TAG#v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/${TAG}.tar.gz"
+          curl -fsSL "$url" -o source.tar.gz
+          sha=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          sed -i "s/^pkgver=.*/pkgver=${version}/" contrib/aur/clipferry/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${sha}')/" contrib/aur/clipferry/PKGBUILD
+          echo "pinned clipferry ${version} (${sha})"
+      - name: Publish clipferry
+        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
+        with:
+          pkgname: clipferry
+          pkgbuild: contrib/aur/clipferry/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "release: sync from GitHub"
+      - name: Publish clipferry-git
+        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
+        with:
+          pkgname: clipferry-git
+          pkgbuild: contrib/aur/clipferry-git/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "release: sync from GitHub"
