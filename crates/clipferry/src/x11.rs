@@ -12,10 +12,12 @@ use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, Timestamp, Window, WindowClass,
+    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, Timestamp, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
+
+use crate::SelKind;
 
 atom_manager! {
     pub Atoms:
@@ -31,6 +33,7 @@ atom_manager! {
         TEXT_PLAIN_UTF8: b"text/plain;charset=utf-8",
         CLIPFERRY: b"_CLIPFERRY",
         CLIPFERRY_TARGETS: b"_CLIPFERRY_TARGETS",
+        CLIPFERRY_TARGETS_PRIMARY: b"_CLIPFERRY_TARGETS_PRIMARY",
     }
 }
 
@@ -38,9 +41,9 @@ pub struct X11 {
     pub conn: Arc<RustConnection>,
     pub win: Window,
     pub atoms: Atoms,
-    /// Server timestamp of our current `CLIPBOARD` ownership; `None` when a
-    /// real X11 app (or nobody) owns the selection.
-    pub owned_since: Option<Timestamp>,
+    /// Server timestamp of our ownership per selection (§4.1); `None` when
+    /// a real X11 app (or nobody) owns it. Indexed by `SelKind::idx`.
+    pub owned_since: [Option<Timestamp>; 2],
     /// Largest payload we can ship in a single non-INCR `ChangeProperty`.
     pub max_payload: usize,
     pub xfixes_version: (u32, u32),
@@ -67,7 +70,25 @@ pub fn connect_with_retry() -> (Arc<RustConnection>, usize) {
 }
 
 impl X11 {
-    pub fn new(conn: Arc<RustConnection>, screen_num: usize) -> anyhow::Result<Self> {
+    pub const fn selection_atom(&self, kind: SelKind) -> Atom {
+        match kind {
+            SelKind::Clipboard => self.atoms.CLIPBOARD,
+            SelKind::Primary => 1, // AtomEnum::PRIMARY
+        }
+    }
+
+    const fn targets_property(&self, kind: SelKind) -> Atom {
+        match kind {
+            SelKind::Clipboard => self.atoms.CLIPFERRY_TARGETS,
+            SelKind::Primary => self.atoms.CLIPFERRY_TARGETS_PRIMARY,
+        }
+    }
+
+    pub fn new(
+        conn: Arc<RustConnection>,
+        screen_num: usize,
+        primary: bool,
+    ) -> anyhow::Result<Self> {
         let screen = &conn.setup().roots[screen_num];
         let win = conn.generate_id().context("allocate window id")?;
         conn.create_window(
@@ -92,14 +113,15 @@ impl X11 {
             .context("XFIXES is mandatory (§6)")?
             .reply()
             .context("XFIXES version handshake")?;
-        conn.xfixes_select_selection_input(
-            win,
-            atoms.CLIPBOARD,
-            xfixes::SelectionEventMask::SET_SELECTION_OWNER
-                | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
-                | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
-        )
-        .context("subscribe to XFIXES selection events")?;
+        let mask = xfixes::SelectionEventMask::SET_SELECTION_OWNER
+            | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+            | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
+        conn.xfixes_select_selection_input(win, atoms.CLIPBOARD, mask)
+            .context("subscribe to XFIXES selection events")?;
+        if primary {
+            conn.xfixes_select_selection_input(win, AtomEnum::PRIMARY.into(), mask)
+                .context("subscribe to XFIXES PRIMARY events")?;
+        }
 
         // Headroom under the max request size for the ChangeProperty header.
         let max_payload = conn.maximum_request_bytes().saturating_sub(1024);
@@ -109,7 +131,7 @@ impl X11 {
             conn,
             win,
             atoms,
-            owned_since: None,
+            owned_since: [None, None],
             max_payload,
             xfixes_version: (xfixes_reply.major_version, xfixes_reply.minor_version),
         })
@@ -149,57 +171,56 @@ impl X11 {
         }
     }
 
-    /// Claim CLIPBOARD as proxy for the Wayland owner. Returns any unrelated
+    /// Claim `kind` as proxy for the Wayland owner. Returns any unrelated
     /// events soaked up while acquiring the timestamp.
-    pub fn claim(&mut self) -> anyhow::Result<Vec<Event>> {
+    pub fn claim(&mut self, kind: SelKind) -> anyhow::Result<Vec<Event>> {
         let mut pending = Vec::new();
         let time = self.server_time(&mut pending)?;
-        self.conn
-            .set_selection_owner(self.win, self.atoms.CLIPBOARD, time)?;
-        let owner = self
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?
-            .owner;
+        let selection = self.selection_atom(kind);
+        self.conn.set_selection_owner(self.win, selection, time)?;
+        let owner = self.conn.get_selection_owner(selection)?.reply()?.owner;
         if owner == self.win {
-            self.owned_since = Some(time);
-            info!("claimed X11 CLIPBOARD (proxying Wayland selection)");
+            self.owned_since[kind.idx()] = Some(time);
+            info!("claimed X11 {} (proxying Wayland selection)", kind.label());
         } else {
-            // Somebody beat us to it; XFIXES (M2) will tell us about them.
-            self.owned_since = None;
-            warn!("X11 CLIPBOARD claim lost the race (owner=0x{owner:x})");
+            // Somebody beat us to it; XFIXES will tell us about them.
+            self.owned_since[kind.idx()] = None;
+            warn!(
+                "X11 {} claim lost the race (owner=0x{owner:x})",
+                kind.label()
+            );
         }
         self.conn.flush()?;
         Ok(pending)
     }
 
-    pub fn release(&mut self) -> anyhow::Result<()> {
-        if let Some(time) = self.owned_since.take() {
+    pub fn release(&mut self, kind: SelKind) -> anyhow::Result<()> {
+        if let Some(time) = self.owned_since[kind.idx()].take() {
             self.conn
-                .set_selection_owner(x11rb::NONE, self.atoms.CLIPBOARD, time)?;
+                .set_selection_owner(x11rb::NONE, self.selection_atom(kind), time)?;
             self.conn.flush()?;
-            info!("released X11 CLIPBOARD");
+            info!("released X11 {}", kind.label());
         }
         Ok(())
     }
 
-    /// Current CLIPBOARD owner window (0 = none). Startup probe (§4.1).
-    pub fn selection_owner(&self) -> anyhow::Result<Window> {
+    /// Current owner window of `kind` (0 = none). Startup probe (§4.1).
+    pub fn selection_owner(&self, kind: SelKind) -> anyhow::Result<Window> {
         Ok(self
             .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
+            .get_selection_owner(self.selection_atom(kind))?
             .reply()?
             .owner)
     }
 
     /// Ask the current X11 owner for its TARGETS; the reply lands as a
     /// `SelectionNotify` in the main event loop.
-    pub fn fetch_targets(&self) -> anyhow::Result<()> {
+    pub fn fetch_targets(&self, kind: SelKind) -> anyhow::Result<()> {
         self.conn.convert_selection(
             self.win,
-            self.atoms.CLIPBOARD,
+            self.selection_atom(kind),
             self.atoms.TARGETS,
-            self.atoms.CLIPFERRY_TARGETS,
+            self.targets_property(kind),
             x11rb::CURRENT_TIME,
         )?;
         self.conn.flush()?;
@@ -207,13 +228,16 @@ impl X11 {
     }
 
     /// Read and delete the TARGETS reply property; returns the target atoms.
-    pub fn read_targets_property(&self) -> anyhow::Result<Vec<x11rb::protocol::xproto::Atom>> {
+    pub fn read_targets_property(
+        &self,
+        kind: SelKind,
+    ) -> anyhow::Result<Vec<x11rb::protocol::xproto::Atom>> {
         let reply = self
             .conn
             .get_property(
                 true, // delete
                 self.win,
-                self.atoms.CLIPFERRY_TARGETS,
+                self.targets_property(kind),
                 AtomEnum::ATOM,
                 0,
                 u32::MAX / 4,
@@ -223,37 +247,20 @@ impl X11 {
         Ok(reply.value32().map(Iterator::collect).unwrap_or_default())
     }
 
-    /// Translate the owner's target atoms into Wayland MIME types (§7):
-    /// plain text collapses into the standard text set, protocol atoms are
-    /// dropped, everything else passes through under its atom name verbatim.
-    pub fn targets_to_mimes(&self, targets: &[x11rb::protocol::xproto::Atom]) -> Vec<String> {
+    /// Resolve target atoms to their names; translation happens in
+    /// `mime::x2w_translate` (§7).
+    pub fn target_names(&self, targets: &[x11rb::protocol::xproto::Atom]) -> Vec<String> {
         let cookies: Vec<_> = targets
             .iter()
             .map(|&a| self.conn.get_atom_name(a))
             .collect();
-        let mut passthrough: Vec<String> = Vec::new();
-        let mut has_text = false;
+        let mut names = Vec::new();
         for cookie in cookies {
             let Ok(cookie) = cookie else { continue };
             let Ok(reply) = cookie.reply() else { continue };
-            let name = String::from_utf8_lossy(&reply.name).into_owned();
-            if crate::mime::PROTOCOL_TARGETS.contains(&name.as_str()) {
-                continue;
-            }
-            if crate::mime::is_plain_text(&name) {
-                has_text = true;
-                continue;
-            }
-            if !passthrough.contains(&name) {
-                passthrough.push(name);
-            }
+            names.push(String::from_utf8_lossy(&reply.name).into_owned());
         }
-        let mut mimes: Vec<String> = Vec::new();
-        if has_text {
-            mimes.extend(crate::mime::X2W_TEXT_MIMES.iter().map(|s| (*s).to_owned()));
-        }
-        mimes.extend(passthrough);
-        mimes
+        names
     }
 
     /// Intern atoms for the MIME types we advertise as X11 targets when

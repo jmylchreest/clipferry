@@ -25,6 +25,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
+use crate::SelKind;
 use crate::app::App;
 
 /// Per-offer user data: MIME types accumulate here between the offer's
@@ -50,37 +51,50 @@ impl OfferMimes {
 
 pub enum Manager {
     Ext(ExtDataControlManagerV1),
-    Wlr(ZwlrDataControlManagerV1),
+    Wlr(ZwlrDataControlManagerV1, u32),
 }
 
 impl Manager {
     pub const fn protocol_name(&self) -> &'static str {
         match self {
             Self::Ext(_) => "ext-data-control-v1",
-            Self::Wlr(_) => "zwlr-data-control-v1",
+            Self::Wlr(..) => "zwlr-data-control-v1",
+        }
+    }
+
+    /// PRIMARY needs ext (any version) or zwlr ≥ 2.
+    pub const fn supports_primary(&self) -> bool {
+        match self {
+            Self::Ext(_) => true,
+            Self::Wlr(_, version) => *version >= 2,
         }
     }
 
     pub fn get_data_device(&self, seat: &WlSeat, qh: &QueueHandle<App>) -> Device {
         match self {
             Self::Ext(m) => Device::Ext(m.get_data_device(seat, qh, ())),
-            Self::Wlr(m) => Device::Wlr(m.get_data_device(seat, qh, ())),
+            Self::Wlr(m, _) => Device::Wlr(m.get_data_device(seat, qh, ())),
         }
     }
 
     /// Create a data source offering `mime_types` (our proxy claim for an
-    /// X11 owner).
-    pub fn create_source(&self, mime_types: &[String], qh: &QueueHandle<App>) -> Source {
+    /// X11 owner), tagged with the selection it will be set on.
+    pub fn create_source(
+        &self,
+        mime_types: &[String],
+        kind: SelKind,
+        qh: &QueueHandle<App>,
+    ) -> Source {
         match self {
             Self::Ext(m) => {
-                let s = m.create_data_source(qh, ());
+                let s = m.create_data_source(qh, SourceData { kind });
                 for mime in mime_types {
                     s.offer(mime.clone());
                 }
                 Source::Ext(s)
             }
-            Self::Wlr(m) => {
-                let s = m.create_data_source(qh, ());
+            Self::Wlr(m, _) => {
+                let s = m.create_data_source(qh, SourceData { kind });
                 for mime in mime_types {
                     s.offer(mime.clone());
                 }
@@ -90,18 +104,32 @@ impl Manager {
     }
 }
 
+/// Per-source user data: which selection this proxy source belongs to.
+pub struct SourceData {
+    pub kind: SelKind,
+}
+
 pub enum Device {
     Ext(ExtDataControlDeviceV1),
     Wlr(ZwlrDataControlDeviceV1),
 }
 
 impl Device {
-    pub fn set_selection(&self, source: Option<&Source>) {
-        match (self, source) {
-            (Self::Ext(d), Some(Source::Ext(s))) => d.set_selection(Some(s)),
-            (Self::Ext(d), None) => d.set_selection(None),
-            (Self::Wlr(d), Some(Source::Wlr(s))) => d.set_selection(Some(s)),
-            (Self::Wlr(d), None) => d.set_selection(None),
+    pub fn set_selection(&self, kind: SelKind, source: Option<&Source>) {
+        match (self, source, kind) {
+            (Self::Ext(d), Some(Source::Ext(s)), SelKind::Clipboard) => d.set_selection(Some(s)),
+            (Self::Ext(d), None, SelKind::Clipboard) => d.set_selection(None),
+            (Self::Ext(d), Some(Source::Ext(s)), SelKind::Primary) => {
+                d.set_primary_selection(Some(s));
+            }
+            (Self::Ext(d), None, SelKind::Primary) => d.set_primary_selection(None),
+            (Self::Wlr(d), Some(Source::Wlr(s)), SelKind::Clipboard) => d.set_selection(Some(s)),
+            (Self::Wlr(d), None, SelKind::Clipboard) => d.set_selection(None),
+            // Guarded by Manager::supports_primary at startup (zwlr ≥ 2).
+            (Self::Wlr(d), Some(Source::Wlr(s)), SelKind::Primary) => {
+                d.set_primary_selection(Some(s));
+            }
+            (Self::Wlr(d), None, SelKind::Primary) => d.set_primary_selection(None),
             // Device and source always come from the same bound manager.
             _ => unreachable!("data-control protocol mismatch between device and source"),
         }
@@ -168,8 +196,9 @@ pub fn bind_manager(globals: &GlobalList, qh: &QueueHandle<App>) -> anyhow::Resu
     if let Ok(m) = globals.bind::<ExtDataControlManagerV1, App, ()>(qh, 1..=1, ()) {
         return Ok(Manager::Ext(m));
     }
-    if let Ok(m) = globals.bind::<ZwlrDataControlManagerV1, App, ()>(qh, 1..=1, ()) {
-        return Ok(Manager::Wlr(m));
+    if let Ok(m) = globals.bind::<ZwlrDataControlManagerV1, App, ()>(qh, 1..=2, ()) {
+        let version = m.version();
+        return Ok(Manager::Wlr(m, version));
     }
     bail!(
         "compositor advertises neither ext-data-control-v1 nor zwlr-data-control-v1; \
@@ -213,11 +242,12 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for App {
     ) {
         match event {
             ext_data_control_device_v1::Event::Selection { id } => {
-                state.on_wayland_selection(id.map(Offer::Ext));
+                state.on_wayland_selection(SelKind::Clipboard, id.map(Offer::Ext));
             }
             ext_data_control_device_v1::Event::Finished => state.on_wayland_finished(),
-            // --primary is M4; destroy its offers so they don't leak.
-            ext_data_control_device_v1::Event::PrimarySelection { id: Some(o) } => o.destroy(),
+            ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                state.on_wayland_primary(id.map(Offer::Ext));
+            }
             // DataOffer: MIME types accumulate in the offer's user data
             // until a Selection event activates the offer.
             _ => {}
@@ -240,10 +270,12 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
     ) {
         match event {
             zwlr_data_control_device_v1::Event::Selection { id } => {
-                state.on_wayland_selection(id.map(Offer::Wlr));
+                state.on_wayland_selection(SelKind::Clipboard, id.map(Offer::Wlr));
             }
             zwlr_data_control_device_v1::Event::Finished => state.on_wayland_finished(),
-            zwlr_data_control_device_v1::Event::PrimarySelection { id: Some(o) } => o.destroy(),
+            zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                state.on_wayland_primary(id.map(Offer::Wlr));
+            }
             _ => {}
         }
     }
@@ -253,42 +285,42 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for App {
     ]);
 }
 
-impl Dispatch<ExtDataControlSourceV1, ()> for App {
+impl Dispatch<ExtDataControlSourceV1, SourceData> for App {
     fn event(
         state: &mut Self,
         proxy: &ExtDataControlSourceV1,
         event: ext_data_control_source_v1::Event,
-        (): &(),
+        data: &SourceData,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         match event {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
-                state.on_source_send(&Source::Ext(proxy.clone()), &mime_type, fd);
+                state.on_source_send(data.kind, &Source::Ext(proxy.clone()), &mime_type, fd);
             }
             ext_data_control_source_v1::Event::Cancelled => {
-                state.on_source_cancelled(&Source::Ext(proxy.clone()));
+                state.on_source_cancelled(data.kind, &Source::Ext(proxy.clone()));
             }
             _ => {}
         }
     }
 }
 
-impl Dispatch<ZwlrDataControlSourceV1, ()> for App {
+impl Dispatch<ZwlrDataControlSourceV1, SourceData> for App {
     fn event(
         state: &mut Self,
         proxy: &ZwlrDataControlSourceV1,
         event: zwlr_data_control_source_v1::Event,
-        (): &(),
+        data: &SourceData,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
-                state.on_source_send(&Source::Wlr(proxy.clone()), &mime_type, fd);
+                state.on_source_send(data.kind, &Source::Wlr(proxy.clone()), &mime_type, fd);
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
-                state.on_source_cancelled(&Source::Wlr(proxy.clone()));
+                state.on_source_cancelled(data.kind, &Source::Wlr(proxy.clone()));
             }
             _ => {}
         }

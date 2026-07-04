@@ -1,0 +1,10 @@
+# Coverage is informational: the protocol/transfer layers need live display
+# servers to exercise and are covered by the live/integration tests instead.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true

@@ -21,7 +21,9 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use zeroize::Zeroizing;
 
-use crate::payload::{CHUNK_SIZE, PayloadRope, ReadOutcome};
+use crate::SelKind;
+use crate::mime::Transform;
+use crate::payload::{CHUNK_SIZE, PayloadRope, ReadOutcome, Snapshot, SnapshotReader};
 use crate::x11::Atoms;
 
 /// How long we wait for the peer to answer pure protocol handshakes
@@ -102,37 +104,56 @@ pub struct PasteReply {
     pub property: Atom,
     pub reply_type: Atom,
     pub conversion: Conv,
+    /// §7 translation applied while serving (e.g. synthesize the GNOME
+    /// copied-files header in front of a uri-list).
+    pub transform: Transform,
     pub timeout: Option<Duration>,
 }
 
 pub fn spawn_wayland_read(reply: PasteReply, src: PipeReader) {
     std::thread::spawn(move || {
-        let (conn, _) = match RustConnection::connect(None) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("W→X transfer: no X11 connection: {e}");
-                return;
-            }
+        let timeout = reply.timeout;
+        let mut reader = IdleReader {
+            inner: src,
+            timeout,
         };
-        if let Err(e) = serve_w2x(&conn, &reply, src) {
-            warn!("W→X transfer failed: {e:#}");
-            notify(&conn, &reply.req, None);
-            let _ = conn.flush();
-        }
+        run_w2x(&reply, &mut reader);
     });
 }
 
-fn serve_w2x(conn: &RustConnection, reply: &PasteReply, src: PipeReader) -> anyhow::Result<()> {
+/// Eager mode: serve the same request from the in-memory snapshot instead
+/// of touching the (possibly gone) source app.
+pub fn spawn_snapshot_serve(reply: PasteReply, snapshot: std::sync::Arc<Snapshot>, mime: String) {
+    std::thread::spawn(move || {
+        let mut reader = SnapshotReader::new(snapshot, mime);
+        run_w2x(&reply, &mut reader);
+    });
+}
+
+fn run_w2x(reply: &PasteReply, reader: &mut impl Read) {
+    let (conn, _) = match RustConnection::connect(None) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("W→X transfer: no X11 connection: {e}");
+            return;
+        }
+    };
+    if let Err(e) = serve_w2x(&conn, reply, reader) {
+        warn!("W→X transfer failed: {e:#}");
+        notify(&conn, &reply.req, None);
+        let _ = conn.flush();
+    }
+}
+
+fn serve_w2x(
+    conn: &RustConnection,
+    reply: &PasteReply,
+    reader: &mut impl Read,
+) -> anyhow::Result<()> {
     let atoms = Atoms::new(conn).context("intern transfer atoms")?.reply()?;
     let max_payload = conn.maximum_request_bytes().saturating_sub(1024);
-    let mut reader = IdleReader {
-        inner: src,
-        timeout: reply.timeout,
-    };
 
-    match PayloadRope::read_to_end(&mut reader, Some(max_payload))
-        .context("read from Wayland source")?
-    {
+    match PayloadRope::read_to_end(reader, Some(max_payload)).context("read from Wayland source")? {
         ReadOutcome::Complete(rope) => {
             let data = rope.to_contiguous();
             let data = match reply.conversion {
@@ -148,6 +169,14 @@ fn serve_w2x(conn: &RustConnection, reply: &PasteReply, src: PipeReader) -> anyh
                     }
                 }
                 Conv::Latin1ToUtf8 => latin1_to_utf8(&data),
+            };
+            let data = if reply.transform == Transform::PrependCopyHeader {
+                let mut with_header = Zeroizing::new(Vec::with_capacity(data.len() + 5));
+                with_header.extend_from_slice(b"copy\n");
+                with_header.extend_from_slice(&data);
+                with_header
+            } else {
+                data
             };
             conn.change_property8(
                 PropMode::REPLACE,
@@ -170,7 +199,7 @@ fn serve_w2x(conn: &RustConnection, reply: &PasteReply, src: PipeReader) -> anyh
                 conn.flush()?;
                 return Ok(());
             }
-            serve_w2x_incr(conn, &atoms, reply, &head, &mut reader)?;
+            serve_w2x_incr(conn, &atoms, reply, &head, reader)?;
         }
     }
     Ok(())
@@ -209,6 +238,10 @@ fn serve_w2x_incr(
         .context("INCR: requestor did not accept the transfer")?;
 
     let mut total = 0_usize;
+    if reply.transform == Transform::PrependCopyHeader {
+        write_incr_chunk(conn, reply, b"copy\n")?;
+        total += 5;
+    }
     // First the buffered head, then stream the rest of the pipe.
     for chunk in head.chunks() {
         total += chunk.len();
@@ -293,10 +326,49 @@ fn wait_property_delete(
 
 // --- X→W: serve a Wayland paste from the X11 owner -------------------------
 
-/// A Wayland client asked our data source for `mime`.
-pub fn spawn_x11_read(mime: String, fd: std::os::fd::OwnedFd, timeout: Option<Duration>) {
+/// One X→W read: what to fetch from the X11 owner and how to deliver it.
+pub struct X2wRequest {
+    pub mime: String,
+    /// §7 read plan override: (x11 target name, transform). Default: text
+    /// candidates for plain text, else the MIME name as the exact target.
+    pub plan: Option<(String, Transform)>,
+    pub kind: SelKind,
+    pub fd: std::os::fd::OwnedFd,
+    pub timeout: Option<Duration>,
+}
+
+/// X→W reads are serialized: many X11 owners (xclip, older toolkits) are
+/// single-threaded, and a second `ConvertSelection` while an INCR dance is in
+/// flight can wedge them. History managers make concurrent reads the norm.
+static X2W_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Eager X→W: serve a Wayland paste straight from the snapshot.
+pub fn spawn_rope_to_fd(
+    snapshot: std::sync::Arc<Snapshot>,
+    mime: String,
+    fd: std::os::fd::OwnedFd,
+) {
     std::thread::spawn(move || {
-        if let Err(e) = serve_x2w(&mime, fd, timeout) {
+        use std::io::Write as _;
+        let mut out = std::fs::File::from(fd);
+        let mut reader = SnapshotReader::new(snapshot, mime);
+        let mut buf = Zeroizing::new(vec![0_u8; CHUNK_SIZE]);
+        while let Ok(n) = std::io::Read::read(&mut reader, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            if out.write_all(&buf[..n]).is_err() {
+                debug!("eager X→W: reader closed early (EPIPE)");
+                break;
+            }
+        }
+    });
+}
+
+/// A Wayland client asked our data source for `request.mime`.
+pub fn spawn_x11_read(request: X2wRequest) {
+    std::thread::spawn(move || {
+        if let Err(e) = serve_x2w(request) {
             // EPIPE is routine: history managers close their read end early.
             let broken_pipe = e
                 .downcast_ref::<std::io::Error>()
@@ -310,11 +382,18 @@ pub fn spawn_x11_read(mime: String, fd: std::os::fd::OwnedFd, timeout: Option<Du
     });
 }
 
-fn serve_x2w(
-    mime: &str,
-    fd: std::os::fd::OwnedFd,
-    timeout: Option<Duration>,
-) -> anyhow::Result<()> {
+fn serve_x2w(request: X2wRequest) -> anyhow::Result<()> {
+    let X2wRequest {
+        mime,
+        plan,
+        kind,
+        fd,
+        timeout,
+    } = request;
+    let mime = mime.as_str();
+    let _turn = X2W_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut out = std::fs::File::from(fd);
     let (conn, screen_num) = RustConnection::connect(None).context("transfer X11 connection")?;
     let atoms = Atoms::new(&conn)
@@ -336,12 +415,20 @@ fn serve_x2w(
         &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
     )?;
 
-    // Text MIMEs try UTF8_STRING then STRING; anything else converts the
-    // exact atom named like the MIME (§7: pass-through, clipferry is a pipe).
-    let candidates: Vec<(Atom, Conv)> = if crate::mime::is_plain_text(mime) {
+    // §7 read plans: an explicit plan wins; text MIMEs try UTF8_STRING then
+    // STRING; anything else converts the exact atom named like the MIME
+    // (pass-through — clipferry is a pipe).
+    let candidates: Vec<(Atom, Conv, Transform)> = if let Some((target_name, transform)) = plan {
+        let atom = conn
+            .intern_atom(false, target_name.as_bytes())?
+            .reply()
+            .context("intern plan target atom")?
+            .atom;
+        vec![(atom, Conv::None, transform)]
+    } else if crate::mime::is_plain_text(mime) {
         let want_utf8 = mime != "STRING";
         vec![
-            (atoms.UTF8_STRING, Conv::None),
+            (atoms.UTF8_STRING, Conv::None, Transform::None),
             (
                 Atom::from(AtomEnum::STRING),
                 if want_utf8 {
@@ -349,6 +436,7 @@ fn serve_x2w(
                 } else {
                     Conv::None
                 },
+                Transform::None,
             ),
         ]
     } else {
@@ -357,21 +445,25 @@ fn serve_x2w(
             .reply()
             .context("intern MIME atom")?
             .atom;
-        vec![(atom, Conv::None)]
+        vec![(atom, Conv::None, Transform::None)]
     };
 
-    for (target, conversion) in candidates {
-        conn.convert_selection(
-            win,
-            atoms.CLIPBOARD,
-            target,
-            atoms.CLIPFERRY,
-            x11rb::CURRENT_TIME,
-        )?;
+    let selection = match kind {
+        SelKind::Clipboard => atoms.CLIPBOARD,
+        SelKind::Primary => Atom::from(AtomEnum::PRIMARY),
+    };
+    for (target, conversion, transform) in candidates {
+        conn.convert_selection(win, selection, target, atoms.CLIPFERRY, x11rb::CURRENT_TIME)?;
         conn.flush()?;
         match wait_selection_notify(&conn, win)? {
             Some(property) if property != x11rb::NONE => {
-                return stream_x11_property(&conn, win, &atoms, conversion, timeout, &mut out);
+                let mut sink = Sink {
+                    out: &mut out,
+                    conversion,
+                    strip_pending: transform == Transform::StripCopyHeader,
+                    total: 0,
+                };
+                return stream_x11_property(&conn, win, &atoms, timeout, &mut sink);
             }
             _ => {} // owner refused this target — try the next candidate
         }
@@ -397,24 +489,58 @@ fn wait_selection_notify(conn: &RustConnection, win: Window) -> anyhow::Result<O
     }
 }
 
+/// Streaming sink for X→W transfers: applies the §7 head transform and any
+/// charset conversion, tracks totals.
+struct Sink<'a> {
+    out: &'a mut std::fs::File,
+    conversion: Conv,
+    /// `StripCopyHeader`: the leading action line has not been consumed yet.
+    strip_pending: bool,
+    total: usize,
+}
+
+impl Sink<'_> {
+    fn write(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let mut data = chunk;
+        if self.strip_pending {
+            match data.iter().position(|&b| b == b'\n') {
+                Some(nl) => {
+                    data = &data[nl + 1..];
+                    self.strip_pending = false;
+                }
+                None => return Ok(()), // header longer than the chunk; keep skipping
+            }
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        match self.conversion {
+            // Latin-1 → UTF-8 is stateless per byte, so chunk-safe.
+            Conv::Latin1ToUtf8 => self.out.write_all(&latin1_to_utf8(data))?,
+            _ => self.out.write_all(data)?,
+        }
+        self.total += data.len();
+        Ok(())
+    }
+}
+
 fn stream_x11_property(
     conn: &RustConnection,
     win: Window,
     atoms: &Atoms,
-    conversion: Conv,
     timeout: Option<Duration>,
-    out: &mut std::fs::File,
+    sink: &mut Sink<'_>,
 ) -> anyhow::Result<()> {
     let head = conn
         .get_property(false, win, atoms.CLIPFERRY, AtomEnum::ANY, 0, 0)?
         .reply()
         .context("probe property type")?;
     if head.type_ == atoms.INCR {
-        return stream_x11_incr(conn, win, atoms, conversion, timeout, out);
+        return stream_x11_incr(conn, win, atoms, timeout, sink);
     }
 
     let mut offset_units = 0_u32;
-    let mut total = 0_usize;
     loop {
         let reply = conn
             .get_property(
@@ -429,7 +555,7 @@ fn stream_x11_property(
             .context("read selection property")?;
         // Take ownership immediately so the payload zeroes on drop (§8.1).
         let chunk = Zeroizing::new(reply.value);
-        total += write_converted(out, &chunk, conversion)?;
+        sink.write(&chunk)?;
         if reply.bytes_after == 0 {
             break;
         }
@@ -437,7 +563,7 @@ fn stream_x11_property(
     }
     conn.delete_property(win, atoms.CLIPFERRY)?;
     conn.flush()?;
-    debug!("served Wayland paste: {total} bytes");
+    debug!("served Wayland paste: {} bytes", sink.total);
     Ok(())
 }
 
@@ -447,13 +573,11 @@ fn stream_x11_incr(
     conn: &RustConnection,
     win: Window,
     atoms: &Atoms,
-    conversion: Conv,
     timeout: Option<Duration>,
-    out: &mut std::fs::File,
+    sink: &mut Sink<'_>,
 ) -> anyhow::Result<()> {
     conn.delete_property(win, atoms.CLIPFERRY)?;
     conn.flush()?;
-    let mut total = 0_usize;
     let mut writer_gone: Option<std::io::Error> = None;
     loop {
         wait_property_new_value(conn, win, atoms.CLIPFERRY, timeout)?;
@@ -469,8 +593,8 @@ fn stream_x11_incr(
         if writer_gone.is_none() {
             // Keep draining after EPIPE: aborting mid-dance leaves a
             // single-threaded owner wedged for every later reader.
-            match write_converted(out, &chunk, conversion) {
-                Ok(n) => total += n,
+            match sink.write(&chunk) {
+                Ok(()) => {}
                 Err(e) => match e.downcast::<std::io::Error>() {
                     Ok(io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => {
                         writer_gone = Some(io_err);
@@ -484,7 +608,7 @@ fn stream_x11_incr(
     if let Some(io_err) = writer_gone {
         return Err(io_err.into());
     }
-    debug!("served Wayland paste via INCR: {total} bytes");
+    debug!("served Wayland paste via INCR: {} bytes", sink.total);
     Ok(())
 }
 
@@ -510,23 +634,6 @@ fn wait_property_new_value(
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-}
-
-fn write_converted(
-    out: &mut std::fs::File,
-    chunk: &[u8],
-    conversion: Conv,
-) -> anyhow::Result<usize> {
-    use std::io::Write as _;
-    if chunk.is_empty() {
-        return Ok(0);
-    }
-    match conversion {
-        // Latin-1 → UTF-8 is stateless per byte, so chunk-safe.
-        Conv::Latin1ToUtf8 => out.write_all(&latin1_to_utf8(chunk))?,
-        _ => out.write_all(chunk)?,
-    }
-    Ok(chunk.len())
 }
 
 // --- Text conversions -------------------------------------------------------
