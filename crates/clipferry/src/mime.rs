@@ -80,12 +80,24 @@ pub enum Transform {
 /// W→X (§7): extra X11 targets to synthesize for a Wayland offer.
 /// Returns (x11 target name, source MIME to read, transform).
 pub fn synthesized_x11_targets(offered: &[String]) -> Vec<(String, String, Transform)> {
+    let has_uri_list = offered.iter().any(|m| m == URI_LIST);
+    let has_gnome = offered.iter().any(|m| m == GNOME_COPIED_FILES);
     let mut extra = Vec::new();
-    if offered.iter().any(|m| m == URI_LIST) && !offered.iter().any(|m| m == GNOME_COPIED_FILES) {
+    if has_uri_list && !has_gnome {
         extra.push((
             GNOME_COPIED_FILES.to_owned(),
             URI_LIST.to_owned(),
             Transform::PrependCopyHeader,
+        ));
+    }
+    // The mirror case: a Wayland file manager offering only the GNOME
+    // format (cut/copy header). X11 apps expecting a plain uri-list get
+    // one synthesized by stripping the action line.
+    if has_gnome && !has_uri_list {
+        extra.push((
+            URI_LIST.to_owned(),
+            GNOME_COPIED_FILES.to_owned(),
+            Transform::StripCopyHeader,
         ));
     }
     extra
@@ -183,6 +195,19 @@ mod tests {
         // Already offered → nothing to synthesize.
         assert!(synthesized_x11_targets(&owned(&["text/uri-list", GNOME_COPIED_FILES])).is_empty());
         assert!(synthesized_x11_targets(&owned(&["image/png"])).is_empty());
+    }
+
+    #[test]
+    fn gnome_only_offer_synthesizes_uri_list_target() {
+        let extra = synthesized_x11_targets(&owned(&[GNOME_COPIED_FILES]));
+        assert_eq!(
+            extra,
+            vec![(
+                URI_LIST.to_owned(),
+                GNOME_COPIED_FILES.to_owned(),
+                Transform::StripCopyHeader
+            )]
+        );
     }
 
     #[test]
