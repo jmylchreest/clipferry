@@ -815,11 +815,14 @@ fn collect_snapshot(
     epoch: u64,
     pipes: Vec<(String, std::io::PipeReader)>,
     cap: Option<usize>,
-    _timeout: Option<Duration>,
+    timeout: Option<Duration>,
     tx: &calloop::channel::Sender<SnapshotMsg>,
 ) {
     let mut data = HashMap::new();
-    for (mime, mut reader) in pipes {
+    for (mime, reader) in pipes {
+        // Same zero-progress bound as lazy transfers: a source that never
+        // writes must not pin the collector (§4.2 governs progress only).
+        let mut reader = transfer::bounded_reader(reader, timeout);
         match PayloadRope::read_to_end(&mut reader, cap) {
             Ok(ReadOutcome::Complete(rope)) => {
                 if !rope.is_empty() {
