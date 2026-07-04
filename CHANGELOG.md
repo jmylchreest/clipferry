@@ -9,4 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- M1: lazy Wayland → X11 text bridging — ext-data-control-v1 (zwlr fallback),
+  X11 selection ownership with TARGETS/TIMESTAMP, per-paste transfer threads,
+  zeroizing chunk-rope payload buffers, `--oneshot-check` diagnostic.
 - Project scaffold: design document, CI pipeline, packaging skeleton.
