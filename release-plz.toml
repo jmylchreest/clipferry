@@ -1,8 +1,9 @@
-# Pre-implementation settings: release-plz maintains the version + changelog PR
-# only. Flip publish/git_release/git_tag to true at M5 (crates.io + first tag).
+# M5: tags + GitHub releases enabled. crates.io publishing turns on once the
+# CARGO_REGISTRY_TOKEN secret exists in the repo (add it, then set
+# publish = true and uncomment the release job's env in release-plz.yml).
 [workspace]
 publish = false
-git_release_enable = false
-git_tag_enable = false
+git_release_enable = true
+git_tag_enable = true
 changelog_update = true
 release_always = false

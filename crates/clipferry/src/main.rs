@@ -38,6 +38,10 @@ fn main() -> ExitCode {
         }
     };
     logging::init(options.log_level);
+    if options.sandbox_selftest {
+        return clipferry::sandbox::selftest();
+    }
+    clipferry::sandbox::disable_dumps();
     match run(&options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -89,6 +93,10 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         println!("result: both sides reachable; bridging supported");
         return Ok(());
     }
+
+    // §8.2 lock sequence: both connections exist (Xauthority has been read
+    // for the main connection; transfer connections keep read access to it).
+    clipferry::sandbox::apply_and_log(options.no_landlock);
 
     let device = manager.get_data_device(&seat, &qh);
     let mut app = App::new(x, wl_conn.clone(), manager, device, qh, options);

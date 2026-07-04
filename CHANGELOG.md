@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- M5: self-applied Landlock sandbox (fs deny-all + read-only Xauthority,
+  TCP deny; BestEffort), PR_SET_DUMPABLE=0, `--no-landlock`, hidden
+  `--sandbox-selftest` (CI-tested), AUR PKGBUILDs, git tags + GitHub
+  releases via release-plz.
 - M4: §7 translation table (gnome-copied-files ⇄ uri-list synthesis, Qt
   image quirk), `--sync-mode eager` with `--eager-max-size` (snapshots
   survive source exit, over-cap types degrade to lazy, best-effort mlock),

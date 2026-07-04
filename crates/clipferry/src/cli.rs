@@ -11,6 +11,7 @@ pub enum SyncMode {
     Eager,
 }
 
+#[allow(clippy::struct_excessive_bools)] // CLI flags are legitimately flags
 pub struct Options {
     pub oneshot_check: bool,
     pub log_level: LevelFilter,
@@ -24,6 +25,10 @@ pub struct Options {
     pub primary: bool,
     /// Do not bridge offers carrying the KDE password-manager hint (§8).
     pub skip_sensitive: bool,
+    /// Debugging escape hatch (§8.2); logged loudly at WARN.
+    pub no_landlock: bool,
+    /// Hidden: apply the sandbox, assert it holds, exit (§8.2).
+    pub sandbox_selftest: bool,
 }
 
 /// Parse a human size: plain bytes, `K`/`M`/`G` (binary) suffixes, or the
@@ -66,6 +71,7 @@ Options:
       --primary                Also bridge the PRIMARY selection
       --skip-sensitive         Do not bridge password-manager-hinted offers
       --transfer-timeout SECS  Idle timeout for payload transfers; 0 = none  [default: 0]
+      --no-landlock            Disable the in-process Landlock sandbox
       --oneshot-check          Connect to both displays, print a diagnostic, exit
       --log-level LEVEL        error|warn|info|debug|trace  [default: info]
   -V, --version            Print version
@@ -88,10 +94,15 @@ fn parse_from(mut parser: lexopt::Parser) -> anyhow::Result<Parsed> {
         eager_max_size: Some(10 << 20),
         primary: false,
         skip_sensitive: false,
+        no_landlock: false,
+        sandbox_selftest: false,
     };
     while let Some(arg) = parser.next()? {
         match arg {
             Long("oneshot-check") => options.oneshot_check = true,
+            Long("no-landlock") => options.no_landlock = true,
+            // Hidden diagnostic (§8.2); deliberately not in --help.
+            Long("sandbox-selftest") => options.sandbox_selftest = true,
             Long("primary") => options.primary = true,
             Long("skip-sensitive") => options.skip_sensitive = true,
             Long("sync-mode") => {

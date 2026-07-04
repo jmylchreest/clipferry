@@ -30,11 +30,14 @@ The community stopgap is a ~480-line bash polling loop that eagerly pipes every 
 | cliphist / clipse / wl-clip-persist | History managers, not bridges — they run happily *alongside* clipferry. |
 | Wait for xwayland-satellite to fix it | It may! clipferry is an honest, focused stopgap: small enough to be finished, useful for as long as satellite setups have gaps. |
 
-## Install (planned)
+## Install
 
-Once released (AUR `clipferry` / `clipferry-git`, crates.io):
+From source (AUR packages ship with the first tagged release — PKGBUILDs live in [`contrib/aur/`](contrib/aur)):
 
 ```sh
+cargo install --git https://github.com/jmylchreest/clipferry
+# or grab a continuous build from the snapshot release below
+mkdir -p ~/.config/systemd/user && cp contrib/clipferry.service ~/.config/systemd/user/
 systemctl --user enable --now clipferry.service
 ```
 
@@ -48,7 +51,7 @@ Continuous builds from `main` are published to the [snapshot release](https://gi
 - [x] **M2** — bidirectional text, ownership-based loop prevention, epoch counter
 - [x] **M3** — all-MIME passthrough + INCR in both directions (10 MB PNG test)
 - [x] **M4** — translation table, `--sync-mode eager`, `--primary`, `--skip-sensitive`
-- [ ] **M5** — Landlock self-sandbox, systemd unit, AUR + crates.io packaging
+- [x] **M5** — Landlock self-sandbox, systemd unit, AUR + crates.io packaging
 
 See [DESIGN.md](DESIGN.md) for the full architecture: broker state machine, lazy vs eager transfer strategy, MIME translation table, memory hygiene, and testing strategy.
 
