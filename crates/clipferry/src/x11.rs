@@ -250,6 +250,30 @@ impl X11 {
         Ok(reply.value32().map(Iterator::collect).unwrap_or_default())
     }
 
+    /// The Xwayland window manager's check window (root
+    /// `_NET_SUPPORTING_WM_CHECK`) — xwayland-satellite's own claims come
+    /// from it. Telemetry (§10.1).
+    pub fn wm_check_window(&self) -> Option<Window> {
+        let atom = self
+            .conn
+            .intern_atom(false, b"_NET_SUPPORTING_WM_CHECK")
+            .ok()?
+            .reply()
+            .ok()?
+            .atom;
+        let root = self.conn.setup().roots.first()?.root;
+        let reply = self
+            .conn
+            .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        reply
+            .value32()
+            .and_then(|mut v| v.next())
+            .filter(|&w| w != x11rb::NONE)
+    }
+
     /// Best-effort identification of an X11 client by window: `WM_CLASS`
     /// (instance\0class\0). Wayland offers no equivalent, and /proc is
     /// unreadable under our own Landlock — the X server is the only source.

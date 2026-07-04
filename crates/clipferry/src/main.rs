@@ -6,7 +6,7 @@ use anyhow::{Context as _, anyhow};
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
-use log::{error, info};
+use log::{debug, error, info};
 use wayland_client::Connection;
 use wayland_client::globals::registry_queue_init;
 use x11rb::rust_connection::RustConnection;
@@ -107,6 +107,10 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     // Startup rule (§4.1): the roundtrip delivers the current Wayland
     // selection (if any); the probe fills the Wayland side if only X11 has
     // an owner. Both sides owned → touch nothing.
+    app.wm_window = app.x11.wm_check_window();
+    if let Some(wm) = app.wm_window {
+        debug!("event=coexist wm_window=0x{wm:x}");
+    }
     event_queue
         .roundtrip(&mut app)
         .context("initial Wayland roundtrip")?;

@@ -6,7 +6,7 @@
 [![Snapshot](https://img.shields.io/github/v/release/jmylchreest/clipferry?include_prereleases&label=snapshot)](https://github.com/jmylchreest/clipferry/releases/tag/snapshot)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: pre-implementation.** The [design](DESIGN.md) is complete; code is landing milestone by milestone (see [Roadmap](#roadmap)). Nothing is usable yet.
+> **Status: functional, pre-1.0.** All five design milestones are implemented and live-tested on niri + xwayland-satellite; snapshot builds are usable today (see [Install](#install)).
 
 ## Why
 
@@ -54,6 +54,10 @@ Continuous builds from `main` are published to the [snapshot release](https://gi
 - [x] **M5** — Landlock self-sandbox, systemd unit, AUR + crates.io packaging
 
 See [DESIGN.md](DESIGN.md) for the full architecture: broker state machine, lazy vs eager transfer strategy, MIME translation table, memory hygiene, and testing strategy.
+
+## Coexistence
+
+clipferry runs in **backstop mode** by default: it watches both clipboards passively and only claims a selection when, ~200 ms after a copy, the other side has not been bridged by anything else (e.g. xwayland-satellite ≥ 0.8's builtin sync, which handles common cases but misses games/Wine and no-X-focus flows). This makes fights with other bridges structurally impossible — clipferry stays idle where your compositor stack already works and fills exactly the gaps. History managers (cliphist/clipse) coexist as before. `--aggressive-claims` restores immediate claiming for bridgeless rootless-Xwayland setups.
 
 ## Development
 

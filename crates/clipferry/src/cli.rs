@@ -27,6 +27,10 @@ pub struct Options {
     pub skip_sensitive: bool,
     /// Debugging escape hatch (§8.2); logged loudly at WARN.
     pub no_landlock: bool,
+    /// §10.1: backstop mode (default) claims only when the other side
+    /// stays silent after a copy. `--aggressive-claims` claims immediately
+    /// and re-claims from *bridge* claims (never from real apps).
+    pub aggressive_claims: bool,
     /// Hidden: apply the sandbox, assert it holds, exit (§8.2).
     pub sandbox_selftest: bool,
 }
@@ -72,6 +76,9 @@ Options:
       --skip-sensitive         Do not bridge password-manager-hinted offers
       --transfer-timeout SECS  Idle timeout for payload transfers; 0 = none  [default: 0]
       --no-landlock            Disable the in-process Landlock sandbox
+      --aggressive-claims      Claim immediately instead of backstopping, and
+                               re-claim when another bridge takes our claim
+                               (never re-claims from real applications)
       --oneshot-check          Connect to both displays, print a diagnostic, exit
       --log-level LEVEL        error|warn|info|debug|trace  [default: info]
   -V, --version            Print version
@@ -95,12 +102,14 @@ fn parse_from(mut parser: lexopt::Parser) -> anyhow::Result<Parsed> {
         primary: false,
         skip_sensitive: false,
         no_landlock: false,
+        aggressive_claims: false,
         sandbox_selftest: false,
     };
     while let Some(arg) = parser.next()? {
         match arg {
             Long("oneshot-check") => options.oneshot_check = true,
             Long("no-landlock") => options.no_landlock = true,
+            Long("aggressive-claims") => options.aggressive_claims = true,
             // Hidden diagnostic (§8.2); deliberately not in --help.
             Long("sandbox-selftest") => options.sandbox_selftest = true,
             Long("primary") => options.primary = true,
