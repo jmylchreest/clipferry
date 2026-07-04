@@ -64,6 +64,16 @@ pub fn is_sensitive(types: &[String]) -> bool {
     types.iter().any(|t| t == KDE_PASSWORD_HINT)
 }
 
+/// Detect Xwayland-bridge mirror offers (telemetry only, §10.1).
+///
+/// Xwayland's builtin selection bridge mirrors X11 `TARGETS` verbatim as
+/// Wayland MIME strings — including protocol atoms no real application
+/// would offer. Logged for diagnosis; behavior is governed by the
+/// ownership-anchored bridge guard, not by this fingerprint.
+pub fn is_x11_mirror(mime_types: &[String]) -> bool {
+    mime_types.iter().any(|t| t == "TARGETS") && mime_types.iter().any(|t| t == "TIMESTAMP")
+}
+
 /// Streamable content transform for the §7 translation rows. Both variants
 /// only touch the head of the stream, so they are chunk-safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -245,6 +255,20 @@ mod tests {
         // Without a uri-list the Qt image passes through verbatim.
         let (adv, _) = x2w_translate(&owned(&[QT_IMAGE]));
         assert!(adv.contains(&QT_IMAGE.to_owned()));
+    }
+
+    #[test]
+    fn mirror_detection() {
+        assert!(is_x11_mirror(&owned(&[
+            "TARGETS",
+            "TIMESTAMP",
+            "UTF8_STRING"
+        ])));
+        assert!(!is_x11_mirror(&owned(&[
+            "text/plain;charset=utf-8",
+            "image/png"
+        ])));
+        assert!(!is_x11_mirror(&owned(&["TARGETS"])));
     }
 
     #[test]

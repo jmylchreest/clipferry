@@ -250,6 +250,23 @@ cliphist / wl-clip-persist / clipse also use data-control on the same compositor
 - Writer fights: when a history manager *re-sets* the selection (wl-clip-persist does this when a source app exits), clipferry sees a legitimate new Wayland selection and re-proxies to X11 — correct behavior, no special casing.
 - The failure mode to test: clipferry claims Wayland selection (proxying X11) → history manager immediately re-claims to persist it → clipferry sees non-self owner, claims X11 side… which it already represents. The epoch counter + "content owner is on the X11 side already, new Wayland owner offers identical type list" — **do not** try to detect this by content. Instead: accept the re-claim as the new truth (the history manager is now the source; reads route through it). This converges and cannot loop because each claim transfers ownership to a real client on exactly one side.
 
+## 10.1 Coexistence with other bridges: backstop mode (field-derived, 2026-07-04)
+
+Live findings on niri + xwayland-satellite 0.8.1 (Xwayland ≥ 24.1 builtin selection bridge, activated by satellite's 0.8 clipboard overhaul):
+
+- The builtin bridge is real but partial: it misses exactly the historic gaps (games/Wine, no-X-focus flows) while actively mirroring what it can. Its X11 claims come from the WM check window (`_NET_SUPPORTING_WM_CHECK`); its Wayland mirror offers carry X11 protocol atoms (`TARGETS`, `TIMESTAMP`) verbatim as MIME strings.
+- Bridge-vs-bridge invalidates §10's convergence argument (which assumes the other claimant is a real client): naive mutual mirroring produced ownership ping-pong at machine speed, cancelled real sources mid-claim, and — because Wine's clipboard machinery is synchronous and re-imports on every ownership change — hung Proton games. An unanswered X11 conversion is the single worst output this daemon can produce (see §4.2 zero-progress bound).
+
+**Resolution: claims land only in voids.** Selections cannot be provided without exclusive ownership (both protocols are ownership-based), but contention can be made structurally impossible:
+
+- Watch both sides passively (XFIXES + data-control cost nothing and claim nothing).
+- After a copy on one side, wait `GAP_WINDOW` (200 ms) for the other side to update by itself. If any other actor bridged it — do nothing. If it stayed silent — fill the gap (fetch targets / claim, eager snapshot recommended so chains built on top of us terminate in real bytes).
+- Generation counters per side invalidate stale fills; a fill also stands down if we already provide the target side.
+- Another bridge's artifacts are never proxied: X11 claims by the WM check window and Wayland offers with the protocol-atom fingerprint are tracked as changes but never bridged back (bridging a bridge loops).
+- `--aggressive-claims` opts into the pre-backstop behavior — immediate claims plus a once-per-epoch re-claim when a *bridge* (never a real application) takes our claim — for bridgeless rootless-Xwayland setups where the 200 ms readiness latency is unwanted.
+
+Consequences: at most **one** ownership change per copy reaches X11 requestors; clipferry is idle wherever the platform bridge works and active exactly where it does not.
+
 ## 11. Dependency budget
 
 `x11rb`, `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr`, `calloop`, `landlock`, `zeroize`, `log`, + a tiny args parser (`lexopt` or hand-rolled; **not** `clap` — binary size). Target: `cargo build --release` with `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true` → expect ≈ 1–1.5 MiB.
