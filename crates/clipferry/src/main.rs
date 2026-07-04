@@ -84,18 +84,16 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Keep the device proxy alive for the whole loop; the compositor sends
-    // selection events through it.
-    let _device = manager.get_data_device(&seat, &qh);
+    let device = manager.get_data_device(&seat, &qh);
+    let mut app = App::new(x, wl_conn.clone(), manager, device, qh);
 
-    let mut app = App::new(x, wl_conn.clone());
-
-    // Startup rule (§4.1): this roundtrip delivers the current Wayland
-    // selection (if any) and fills the missing X11 side. The X11-side probe
-    // (X owned, Wayland empty) arrives with the X→W direction in M2.
+    // Startup rule (§4.1): the roundtrip delivers the current Wayland
+    // selection (if any); the probe fills the Wayland side if only X11 has
+    // an owner. Both sides owned → touch nothing.
     event_queue
         .roundtrip(&mut app)
         .context("initial Wayland roundtrip")?;
+    app.probe_x11_startup();
 
     let mut event_loop = EventLoop::<App>::try_new().context("create event loop")?;
     app.loop_signal = Some(event_loop.get_signal());
@@ -114,7 +112,7 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow!("insert X11 source: {e}"))?;
 
-    info!("bridging CLIPBOARD (M1: Wayland → X11, text)");
+    info!("bridging CLIPBOARD (text, bidirectional)");
     event_loop
         .run(None, &mut app, |_| {})
         .context("event loop")?;
