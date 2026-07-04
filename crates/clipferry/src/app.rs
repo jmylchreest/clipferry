@@ -218,6 +218,23 @@ impl App {
                 .into_iter()
                 .filter(|m| !mime::PROTOCOL_TARGETS.contains(&m.as_str()))
                 .collect();
+            // Causality pairing (§10.1): a Wayland update while we are
+            // waiting to fill the Wayland side is the answer to the X11
+            // copy that scheduled the wait — another bridge acted. Consume
+            // the pending fill and never bridge the answer back.
+            if !self.aggressive_claims
+                && self.ctx[kind.idx()]
+                    .pending_fill
+                    .as_ref()
+                    .is_some_and(|f| !f.fill_x11)
+            {
+                self.ctx[kind.idx()].pending_fill = None;
+                debug!(
+                    "event=backstop sel={} fill=wayland action=stand-down reason=bridged",
+                    kind.key()
+                );
+                return;
+            }
             if bridgeable.is_empty() {
                 debug!("event=offer side=wayland sel={} bridgeable=0", kind.key());
                 self.dispatch_broker(kind, broker::Event::WaylandCleared);
@@ -485,96 +502,7 @@ impl App {
                 }
             }
             Event::SelectionRequest(req) => self.on_selection_request(*req),
-            Event::XfixesSelectionNotify(e) => {
-                let Some(kind) = self.kind_for_selection(e.selection) else {
-                    return;
-                };
-                // Loop prevention by identity (§4.3), X11 side.
-                if e.owner == self.x11.win {
-                    return;
-                }
-                let has_owner = e.owner != x11rb::NONE
-                    && e.subtype == x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER;
-                if kind == SelKind::Primary {
-                    self.debounce_primary(PendingPrimary::X11 { has_owner });
-                    return;
-                }
-                self.ctx[kind.idx()].x11_gen += 1;
-                if has_owner {
-                    // §10.1: another bridge's X11 claims (the Xwayland WM
-                    // mirroring the Wayland side) are tracked as a change
-                    // but never proxied — bridging a bridge loops.
-                    if self.wm_window.is_some_and(|wm| wm == e.owner) {
-                        // --aggressive-claims: take our claim back from the
-                        // bridge (its mirror is a text-only subset), once
-                        // per epoch so a persistent bridge can't drive a
-                        // war. Never applies to real applications.
-                        let epoch = self.ctx[kind.idx()].broker.epoch();
-                        if self.aggressive_claims
-                            && matches!(
-                                self.ctx[kind.idx()].broker.state(),
-                                broker::State::WaylandApp { .. }
-                            )
-                            && self.reclaimed_epoch[kind.idx()] != Some(epoch)
-                        {
-                            self.reclaimed_epoch[kind.idx()] = Some(epoch);
-                            info!(
-                                "event=coexist side=x11 sel={} action=reclaim owner=0x{:x}",
-                                kind.key(),
-                                e.owner
-                            );
-                            match self.x11.claim(kind) {
-                                Ok(pending) => {
-                                    for event in pending {
-                                        self.handle_x11_event(&event);
-                                    }
-                                }
-                                Err(err) => {
-                                    self.fatal(err.context("re-claim over bridge"));
-                                }
-                            }
-                        } else {
-                            debug!(
-                                "event=coexist side=x11 sel={} action=observe-wm-claim",
-                                kind.key()
-                            );
-                        }
-                        return;
-                    }
-                    let class = self.x11.owner_class(e.owner);
-                    info!(
-                        "event=owner side=x11 sel={} owner=0x{:x} class={:?}",
-                        kind.key(),
-                        e.owner,
-                        class.as_deref().unwrap_or("unknown")
-                    );
-                    if self.aggressive_claims {
-                        self.ctx[kind.idx()].x11_owner = Some(e.owner);
-                        self.dispatch_broker(kind, broker::Event::X11Selection);
-                    } else {
-                        // Backstop (§10.1): claim Wayland only if it stays
-                        // silent for GAP_WINDOW after this X11 copy.
-                        self.schedule_gap_fill(
-                            kind,
-                            PendingFill {
-                                fill_x11: false,
-                                wl_gen: self.ctx[kind.idx()].wl_gen,
-                                x11_gen: self.ctx[kind.idx()].x11_gen,
-                                mime_types: Vec::new(),
-                                owner: Some(e.owner),
-                            },
-                        );
-                    }
-                } else if self.survives_source_exit(kind, true) {
-                    debug!(
-                        "event=snapshot_serve side=x11 sel={} reason=source-exited",
-                        kind.key()
-                    );
-                } else {
-                    self.ctx[kind.idx()].x11_owner = None;
-                    self.dispatch_broker(kind, broker::Event::X11Cleared);
-                }
-            }
+            Event::XfixesSelectionNotify(e) => self.on_xfixes_notify(e),
             // TARGETS reply for a FetchX11Targets command.
             Event::SelectionNotify(e)
                 if e.requestor == self.x11.win && e.target == self.x11.atoms.TARGETS =>
@@ -585,6 +513,113 @@ impl App {
                 self.on_targets_reply(kind, e.property);
             }
             _ => {}
+        }
+    }
+
+    fn on_xfixes_notify(&mut self, e: &x11rb::protocol::xfixes::SelectionNotifyEvent) {
+        let Some(kind) = self.kind_for_selection(e.selection) else {
+            return;
+        };
+        // Loop prevention by identity (§4.3), X11 side.
+        if e.owner == self.x11.win {
+            return;
+        }
+        let has_owner = e.owner != x11rb::NONE
+            && e.subtype == x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER;
+        if kind == SelKind::Primary {
+            self.debounce_primary(PendingPrimary::X11 { has_owner });
+            return;
+        }
+        self.ctx[kind.idx()].x11_gen += 1;
+        if has_owner {
+            // §10.1: another bridge's X11 claims (the Xwayland WM mirroring
+            // the Wayland side) are tracked as a change but never proxied —
+            // bridging a bridge loops.
+            if self.wm_window.is_some_and(|wm| wm == e.owner) {
+                // --aggressive-claims: take our claim back from the bridge
+                // (its mirror is a text-only subset), once per epoch so a
+                // persistent bridge can't drive a war. Never applies to
+                // real applications.
+                let epoch = self.ctx[kind.idx()].broker.epoch();
+                if self.aggressive_claims
+                    && matches!(
+                        self.ctx[kind.idx()].broker.state(),
+                        broker::State::WaylandApp { .. }
+                    )
+                    && self.reclaimed_epoch[kind.idx()] != Some(epoch)
+                {
+                    self.reclaimed_epoch[kind.idx()] = Some(epoch);
+                    info!(
+                        "event=coexist side=x11 sel={} action=reclaim owner=0x{:x}",
+                        kind.key(),
+                        e.owner
+                    );
+                    match self.x11.claim(kind) {
+                        Ok(pending) => {
+                            for event in pending {
+                                self.handle_x11_event(&event);
+                            }
+                        }
+                        Err(err) => {
+                            self.fatal(err.context("re-claim over bridge"));
+                        }
+                    }
+                } else {
+                    debug!(
+                        "event=coexist side=x11 sel={} action=observe-wm-claim",
+                        kind.key()
+                    );
+                }
+                return;
+            }
+            let class = self.x11.owner_class(e.owner);
+            info!(
+                "event=owner side=x11 sel={} owner=0x{:x} class={:?}",
+                kind.key(),
+                e.owner,
+                class.as_deref().unwrap_or("unknown")
+            );
+            // Causality pairing (§10.1): an X11 update while we are waiting
+            // to fill the X11 side answers the Wayland copy that scheduled
+            // the wait — another bridge acted. Consume, never re-bridge.
+            if !self.aggressive_claims
+                && self.ctx[kind.idx()]
+                    .pending_fill
+                    .as_ref()
+                    .is_some_and(|f| f.fill_x11)
+            {
+                self.ctx[kind.idx()].pending_fill = None;
+                debug!(
+                    "event=backstop sel={} fill=x11 action=stand-down reason=bridged",
+                    kind.key()
+                );
+                return;
+            }
+            if self.aggressive_claims {
+                self.ctx[kind.idx()].x11_owner = Some(e.owner);
+                self.dispatch_broker(kind, broker::Event::X11Selection);
+            } else {
+                // Backstop (§10.1): claim Wayland only if it stays silent
+                // for GAP_WINDOW after this X11 copy.
+                self.schedule_gap_fill(
+                    kind,
+                    PendingFill {
+                        fill_x11: false,
+                        wl_gen: self.ctx[kind.idx()].wl_gen,
+                        x11_gen: self.ctx[kind.idx()].x11_gen,
+                        mime_types: Vec::new(),
+                        owner: Some(e.owner),
+                    },
+                );
+            }
+        } else if self.survives_source_exit(kind, true) {
+            debug!(
+                "event=snapshot_serve side=x11 sel={} reason=source-exited",
+                kind.key()
+            );
+        } else {
+            self.ctx[kind.idx()].x11_owner = None;
+            self.dispatch_broker(kind, broker::Event::X11Cleared);
         }
     }
 
