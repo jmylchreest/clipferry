@@ -4,6 +4,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # quick-xml DoS advisories (quadratic dup-attr check; unbounded NsReader
+  # allocation). Build-time only: quick-xml is used by wayland-scanner (a
+  # proc-macro) to parse the trusted protocol XML vendored in wayland-rs —
+  # it is not in the shipped binary and never sees untrusted input. Remove
+  # when wayland-scanner moves to a patched quick-xml.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
