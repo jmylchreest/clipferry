@@ -73,6 +73,12 @@ pub struct App {
     pub transfer_timeout: Option<Duration>,
     pub snapshot_tx: Option<calloop::channel::Sender<SnapshotMsg>>,
     pub loop_handle: Option<LoopHandle<'static, Self>>,
+    /// The Xwayland WM's check window: X11 claims by it are another
+    /// bridge (xwayland-satellite's builtin sync) mirroring the Wayland
+    /// selection — never bridged, re-claimed over instead.
+    pub wm_window: Option<x11rb::protocol::xproto::Window>,
+    /// Once-per-epoch guard for those re-claims (no claim wars).
+    reclaimed_epoch: [Option<u64>; 2],
     pending_primary: Option<PendingPrimary>,
     primary_gen: u64,
     pub exit: Option<anyhow::Error>,
@@ -103,6 +109,8 @@ impl App {
                 .then(|| Duration::from_secs(options.transfer_timeout)),
             snapshot_tx: None,
             loop_handle: None,
+            wm_window: None,
+            reclaimed_epoch: [None, None],
             pending_primary: None,
             primary_gen: 0,
             exit: None,
@@ -143,6 +151,19 @@ impl App {
         }
         if let Some(offer) = offer {
             let mime_types = offer.mime_types();
+            // Bridge-vs-bridge (satellite/Xwayland builtin sync): a mirror
+            // of the X11 side must never be adopted as a real Wayland
+            // selection — it chains back to the X11 owner (often us) and
+            // its takeover already killed the previous real source.
+            if mime::is_x11_mirror(&mime_types) {
+                info!(
+                    "event=coexist side=wayland sel={} action=ignore-mirror mimes={}",
+                    kind.key(),
+                    mime_types.len()
+                );
+                offer.destroy();
+                return;
+            }
             let sensitive = mime::is_sensitive(&mime_types);
             self.ctx[kind.idx()].sensitive = sensitive;
             if sensitive {
@@ -347,10 +368,12 @@ impl App {
     pub fn handle_x11_event(&mut self, event: &Event) {
         match event {
             Event::SelectionClear(e) => {
+                // Stop serving immediately; the XFIXES notify that always
+                // follows carries the new owner and decides the transition
+                // (a satellite-bridge claim must not tear our state down).
                 if let Some(kind) = self.kind_for_selection(e.selection) {
                     info!("event=lost side=x11 sel={}", kind.key());
                     self.x11.owned_since[kind.idx()] = None;
-                    self.dispatch_broker(kind, broker::Event::X11Lost);
                 }
             }
             Event::SelectionRequest(req) => self.on_selection_request(*req),
@@ -358,8 +381,50 @@ impl App {
                 let Some(kind) = self.kind_for_selection(e.selection) else {
                     return;
                 };
+                debug!(
+                    "event=xfixes sel={} owner=0x{:x} subtype={:?} self=0x{:x}",
+                    kind.key(),
+                    e.owner,
+                    e.subtype,
+                    self.x11.win
+                );
                 // Loop prevention by identity (§4.3), X11 side.
                 if e.owner == self.x11.win {
+                    return;
+                }
+                // Coexistence with the Xwayland WM's own partial sync
+                // (xwayland-satellite ≤ 0.8): its claims mirror the Wayland
+                // selection we already track. Never bridge from it; while
+                // proxying W→X, re-claim once so X11 apps keep the full
+                // type set (satellite bridges text only).
+                if self.wm_window.is_some_and(|wm| wm == e.owner) {
+                    let epoch = self.ctx[kind.idx()].broker.epoch();
+                    let proxying_wayland = matches!(
+                        self.ctx[kind.idx()].broker.state(),
+                        broker::State::WaylandApp { .. }
+                    );
+                    if proxying_wayland && self.reclaimed_epoch[kind.idx()] != Some(epoch) {
+                        self.reclaimed_epoch[kind.idx()] = Some(epoch);
+                        info!(
+                            "event=coexist side=x11 sel={} owner=0x{:x} action=reclaim",
+                            kind.key(),
+                            e.owner
+                        );
+                        match self.x11.claim(kind) {
+                            Ok(pending) => {
+                                for event in pending {
+                                    self.handle_x11_event(&event);
+                                }
+                            }
+                            Err(err) => self.fatal(err.context("re-claim over satellite sync")),
+                        }
+                    } else {
+                        debug!(
+                            "event=coexist side=x11 sel={} owner=0x{:x} action=ignore",
+                            kind.key(),
+                            e.owner
+                        );
+                    }
                     return;
                 }
                 let has_owner = e.owner != x11rb::NONE

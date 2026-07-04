@@ -107,6 +107,10 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     // Startup rule (§4.1): the roundtrip delivers the current Wayland
     // selection (if any); the probe fills the Wayland side if only X11 has
     // an owner. Both sides owned → touch nothing.
+    app.wm_window = app.x11.wm_check_window();
+    if let Some(wm) = app.wm_window {
+        info!("event=coexist wm_window=0x{wm:x}");
+    }
     event_queue
         .roundtrip(&mut app)
         .context("initial Wayland roundtrip")?;
