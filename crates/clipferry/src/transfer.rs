@@ -26,10 +26,14 @@ use crate::mime::Transform;
 use crate::payload::{CHUNK_SIZE, PayloadRope, ReadOutcome, Snapshot, SnapshotReader};
 use crate::x11::Atoms;
 
-/// How long we wait for the peer to answer pure protocol handshakes
-/// (`SelectionNotify` acks). Distinct from the payload idle timeout (§4.2,
-/// default infinite): a peer that won't even acknowledge is dead.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on zero-progress waits: protocol handshakes (`SelectionNotify`
+/// acks) and the *first byte* of a transfer. Distinct from the payload idle
+/// timeout (§4.2, default infinite — which governs *progress*, not
+/// silence): a local peer that produces nothing at all within 2 s is dead
+/// or wedged, and an unanswered X11 conversion hangs synchronous
+/// requestors like Wine's clipboard thread. 2 s is ~200× normal local IPC
+/// latency while still tolerating a busy game hitching.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Text conversion applied while serving.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,16 +65,39 @@ pub fn notify(conn: &RustConnection, req: &SelectionRequestEvent, property: Opti
     }
 }
 
-/// A pipe reader that enforces the §4.2 *idle* timeout when one is set:
-/// each read may wait at most `timeout` for data; any progress resets it.
+/// A pipe reader that enforces the §4.2 *idle* timeout when one is set —
+/// each read may wait at most `timeout` for data; any progress resets it —
+/// and, regardless of configuration, bounds the wait for the *first* byte:
+/// a source that never starts is dead, and an X11 requestor left without a
+/// `SelectionNotify` (Wine) hangs. Infinite applies to progress only.
 struct IdleReader {
     inner: PipeReader,
     timeout: Option<Duration>,
+    /// Zero-progress bound while no byte has arrived yet.
+    first_byte_bound: Duration,
+    /// Cleared once any byte has been read.
+    awaiting_first_byte: bool,
+}
+
+impl IdleReader {
+    const fn new(inner: PipeReader, timeout: Option<Duration>) -> Self {
+        Self {
+            inner,
+            timeout,
+            first_byte_bound: FIRST_BYTE_TIMEOUT,
+            awaiting_first_byte: true,
+        }
+    }
 }
 
 impl Read for IdleReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(timeout) = self.timeout {
+        let bound = if self.awaiting_first_byte {
+            Some(self.timeout.unwrap_or(self.first_byte_bound))
+        } else {
+            self.timeout
+        };
+        if let Some(timeout) = bound {
             let mut fds = [rustix::event::PollFd::new(
                 &self.inner,
                 rustix::event::PollFlags::IN,
@@ -90,8 +117,18 @@ impl Read for IdleReader {
                 Err(e) => return Err(e.into()),
             }
         }
-        self.inner.read(buf)
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.awaiting_first_byte = false;
+        }
+        Ok(n)
     }
+}
+
+/// Public wrapper for eager-fetch pipes: same first-byte/idle semantics as
+/// lazy transfers.
+pub fn bounded_reader(inner: PipeReader, timeout: Option<Duration>) -> impl std::io::Read {
+    IdleReader::new(inner, timeout)
 }
 
 // --- W→X: serve an X11 paste from the Wayland owner ------------------------
@@ -112,11 +149,7 @@ pub struct PasteReply {
 
 pub fn spawn_wayland_read(reply: PasteReply, src: PipeReader) {
     std::thread::spawn(move || {
-        let timeout = reply.timeout;
-        let mut reader = IdleReader {
-            inner: src,
-            timeout,
-        };
+        let mut reader = IdleReader::new(src, reply.timeout);
         run_w2x(&reply, &mut reader);
     });
 }
@@ -533,7 +566,7 @@ fn wait_selection_notify(
     win: Window,
     owner: Window,
 ) -> anyhow::Result<Option<Atom>> {
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let deadline = Instant::now() + FIRST_BYTE_TIMEOUT;
     loop {
         if let Some(event) = conn.poll_for_event()? {
             match event {
@@ -546,7 +579,7 @@ fn wait_selection_notify(
                 _ => {}
             }
         } else if Instant::now() > deadline {
-            bail!("X11 owner did not answer ConvertSelection within {HANDSHAKE_TIMEOUT:?}");
+            bail!("X11 owner did not answer ConvertSelection within {FIRST_BYTE_TIMEOUT:?}");
         } else {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -773,13 +806,38 @@ mod tests {
     #[test]
     fn idle_reader_times_out_without_data() {
         let (reader, _writer) = std::io::pipe().unwrap();
-        let mut r = IdleReader {
-            inner: reader,
-            timeout: Some(Duration::from_millis(50)),
-        };
+        let mut r = IdleReader::new(reader, Some(Duration::from_millis(50)));
         let mut buf = [0_u8; 8];
         let err = r.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn first_byte_is_bounded_even_without_idle_timeout() {
+        // timeout=None (the default config) must still bound a source that
+        // never produces its first byte — the Wine-hang scenario.
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let mut r = IdleReader::new(reader, None);
+        r.first_byte_bound = Duration::from_millis(30);
+        let mut buf = [0_u8; 4];
+        assert_eq!(
+            r.read(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn first_byte_bound_lifts_after_progress() {
+        // Once bytes flow, timeout=None means unbounded again: a second
+        // read on a quiet-but-alive pipe must not hit the first-byte bound.
+        // (We can't wait forever in a test; assert the state flip instead.)
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        std::io::Write::write_all(&mut writer, b"x").unwrap();
+        let mut r = IdleReader::new(reader, None);
+        r.first_byte_bound = Duration::from_millis(30);
+        let mut buf = [0_u8; 1];
+        assert_eq!(r.read(&mut buf).unwrap(), 1);
+        assert!(!r.awaiting_first_byte);
     }
 
     #[test]
@@ -787,10 +845,7 @@ mod tests {
         let (reader, mut writer) = std::io::pipe().unwrap();
         std::io::Write::write_all(&mut writer, b"ping").unwrap();
         drop(writer);
-        let mut r = IdleReader {
-            inner: reader,
-            timeout: Some(Duration::from_secs(5)),
-        };
+        let mut r = IdleReader::new(reader, Some(Duration::from_secs(5)));
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"ping");
