@@ -12,6 +12,16 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow = "1.0.103"
+calloop = "0.14.4"
+calloop-wayland-source = "0.4.1"
+lexopt = "0.3.2"
+log = "0.4.33"
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+x11rb = { version = "0.13.2", features = ["xfixes"] }
+zeroize = "1.9.0"
 
 [lints]
 workspace = true

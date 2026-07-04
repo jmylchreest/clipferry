@@ -4,6 +4,16 @@
 //! The crate is split lib/bin so the broker state machine (sans-IO: events
 //! in, commands out) is unit-testable without a display server.
 
+pub mod app;
+pub mod broker;
+pub mod cli;
+pub mod logging;
+pub mod mime;
+pub mod payload;
+pub mod transfer;
+pub mod wayland;
+pub mod x11;
+
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
