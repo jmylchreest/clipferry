@@ -387,17 +387,24 @@ impl App {
             );
             return;
         }
-        // Already providing the target side ourselves → nothing to do.
-        if fill.fill_x11 && self.x11.owned_since[kind.idx()].is_some() {
-            return;
-        }
-        if !fill.fill_x11 && ctx.our_source.is_some() {
-            return;
-        }
+        // Already providing the target side means our existing claim is
+        // STALE — the copy that scheduled this fill superseded whatever we
+        // were proxying. Refresh (re-dispatch) rather than skip: skipping
+        // leaves X11 advertising a dead offer's types forever (observed:
+        // Wine enumerating a long-gone Chromium target list, every read
+        // 0 bytes, screenshots never crossing). Mirror echoes can't reach
+        // here: fingerprinted offers die at ingress and bridge answers are
+        // consumed by causality pairing.
+        let refresh = if fill.fill_x11 {
+            self.x11.owned_since[kind.idx()].is_some()
+        } else {
+            ctx.our_source.is_some()
+        };
         debug!(
-            "event=backstop sel={} fill={} action=fill",
+            "event=backstop sel={} fill={} action={}",
             kind.key(),
-            if fill.fill_x11 { "x11" } else { "wayland" }
+            if fill.fill_x11 { "x11" } else { "wayland" },
+            if refresh { "refresh" } else { "fill" }
         );
         if fill.fill_x11 {
             self.ctx[kind.idx()].x11_owner = None;
@@ -801,6 +808,17 @@ impl App {
             transfer::notify(&self.x11.conn, &req, None);
             return;
         };
+        // A request for a type the live offer doesn't carry can only yield
+        // a bogus empty payload — refuse promptly instead (requestors like
+        // Wine handle refusals per-format gracefully).
+        if !offer.mime_types().iter().any(|m| m == &mime) {
+            debug!(
+                "event=refuse target-mime={mime:?} reason=not-in-live-offer sel={}",
+                kind.key()
+            );
+            transfer::notify(&self.x11.conn, &req, None);
+            return;
+        }
         let (reader, writer) = match std::io::pipe() {
             Ok(pair) => pair,
             Err(e) => {
