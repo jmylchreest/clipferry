@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use calloop::{LoopHandle, LoopSignal};
@@ -34,6 +34,17 @@ const PRIMARY_DEBOUNCE: Duration = Duration::from_millis(50);
 /// see at most one ownership change per copy.
 const GAP_WINDOW: Duration = Duration::from_millis(200);
 
+/// §4.3 (W-side): how long after our own W→X proxy claim an incoming Wayland
+/// offer may still be that claim mirrored back by the Xwayland WM. The mirror
+/// is a direct causal consequence of the claim and lands in well under a
+/// millisecond (~0.3 ms observed), so this is deliberately tight rather than
+/// generous. The two failure modes are not symmetric: too wide and a genuine
+/// second copy landing in `[claim, claim + window]` — i.e. `GAP_WINDOW` after
+/// its predecessor — is silently swallowed, losing real content; too narrow
+/// and an occasional mirror slips through to the pre-existing behaviour. Only
+/// the first is a regression, so prefer the margin here (~30× observed).
+const MIRROR_ECHO_WINDOW: Duration = Duration::from_millis(10);
+
 /// Per-selection state: broker plus everything a proxy claim carries.
 #[derive(Default)]
 struct SelCtx {
@@ -43,6 +54,10 @@ struct SelCtx {
     /// Wayland-side loop rule: while this is alive, any selection event is
     /// our own claim echoing back (a real takeover cancels the source first).
     our_source: Option<Source>,
+    /// Our own W→X proxy claim. Identity anchor for the §4.3 rule's other
+    /// half: the Xwayland WM mirrors that claim straight back as a Wayland
+    /// offer, which is otherwise indistinguishable from a fresh copy.
+    our_x11_claim: Option<OwnX11Claim>,
     /// W→X: atom → (source MIME to read, transform) for advertised targets.
     proxy_targets: HashMap<Atom, (String, Transform)>,
     /// X→W: advertised MIME → (x11 target, transform) read-plan overrides.
@@ -61,6 +76,27 @@ struct SelCtx {
     sensitive: bool,
     /// §4.2.1 eager snapshot for the current claim.
     snapshot: Option<Arc<Snapshot>>,
+}
+
+/// A proxy claim we made on the X11 side, kept just long enough to recognise
+/// the Xwayland WM mirroring it back onto the Wayland clipboard.
+struct OwnX11Claim {
+    at: Instant,
+    mime_types: Vec<String>,
+}
+
+impl OwnX11Claim {
+    /// True when an offer carrying `mime_types` can only be this claim coming
+    /// back at us: it landed inside `MIRROR_ECHO_WINDOW` and advertises
+    /// nothing we did not ourselves advertise (translation drops protocol
+    /// targets, so the mirror is typically a strict subset).
+    fn is_echo(&self, mime_types: &[String]) -> bool {
+        self.at.elapsed() <= MIRROR_ECHO_WINDOW
+            && !mime_types.is_empty()
+            && mime_types
+                .iter()
+                .all(|m| self.mime_types.iter().any(|c| c == m))
+    }
 }
 
 /// §10.1 backstop: a copy happened on one side; fill the other side at
@@ -165,6 +201,15 @@ impl App {
         self.process_wayland_selection(kind, offer);
     }
 
+    /// True when this offer is the Xwayland WM mirroring the proxy claim we
+    /// just made for the very same content.
+    fn is_own_claim_echo(&self, kind: SelKind, mime_types: &[String]) -> bool {
+        self.ctx[kind.idx()]
+            .our_x11_claim
+            .as_ref()
+            .is_some_and(|claim| claim.is_echo(mime_types))
+    }
+
     pub fn on_wayland_primary(&mut self, offer: Option<Offer>) {
         if self.primary {
             self.on_wayland_selection(SelKind::Primary, offer);
@@ -174,6 +219,21 @@ impl App {
     }
 
     fn process_wayland_selection(&mut self, kind: SelKind, offer: Option<Offer>) {
+        // §4.3: the Xwayland WM re-publishing our own proxy claim is not a
+        // copy. Falling through would destroy `current_offer` below — the
+        // live source the mirror itself ultimately reads through — leaving
+        // the whole chain dead-ended on a cancelled source, so every paste
+        // (including one already streaming) yields nothing.
+        if let Some(o) = &offer
+            && self.is_own_claim_echo(kind, &o.mime_types())
+        {
+            debug!(
+                "event=coexist side=wayland sel={} action=observe-own-claim",
+                kind.key()
+            );
+            o.destroy();
+            return;
+        }
         if let Some(old) = self.ctx[kind.idx()].current_offer.take() {
             old.destroy();
         }
@@ -505,6 +565,7 @@ impl App {
                 if let Some(kind) = self.kind_for_selection(e.selection) {
                     info!("event=lost side=x11 sel={}", kind.key());
                     self.x11.owned_since[kind.idx()] = None;
+                    self.ctx[kind.idx()].our_x11_claim = None;
                     self.dispatch_broker(kind, broker::Event::X11Lost);
                 }
             }
@@ -977,6 +1038,14 @@ impl App {
                 self.ctx[kind.idx()].proxy_targets = map;
                 match self.x11.claim(kind) {
                     Ok(pending) => {
+                        // Only W→X proxy claims get mirrored back onto the
+                        // Wayland clipboard; an empty list would make the
+                        // subset test in `is_own_claim_echo` match anything.
+                        self.ctx[kind.idx()].our_x11_claim =
+                            (!mimes.is_empty()).then(|| OwnX11Claim {
+                                at: Instant::now(),
+                                mime_types: mimes.clone(),
+                            });
                         for event in pending {
                             self.handle_x11_event(&event);
                         }
@@ -987,6 +1056,7 @@ impl App {
             }
             Command::ReleaseX11 => {
                 self.ctx[kind.idx()].proxy_targets.clear();
+                self.ctx[kind.idx()].our_x11_claim = None;
                 if let Err(e) = self.x11.release(kind) {
                     self.fatal(e.context("release X11 selection"));
                 }
@@ -1088,4 +1158,64 @@ fn collect_snapshot(
         kind,
         snapshot: Snapshot { epoch, data },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mimes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn claim_now(list: &[&str]) -> OwnX11Claim {
+        OwnX11Claim {
+            at: Instant::now(),
+            mime_types: mimes(list),
+        }
+    }
+
+    /// The niri-screenshot regression: we backstop-claim X11 for an
+    /// `image/png` offer and Xwayland republishes it onto Wayland ~0.3 ms
+    /// later. Mistaking that for a copy destroys the live offer and every
+    /// subsequent paste reads a cancelled source.
+    #[test]
+    fn own_claim_mirrored_back_is_an_echo() {
+        assert!(claim_now(&["image/png"]).is_echo(&mimes(&["image/png"])));
+    }
+
+    /// Translation drops protocol targets, so the mirror usually comes back
+    /// as a strict subset of what we advertised.
+    #[test]
+    fn echo_may_be_a_subset_of_the_claim() {
+        let claim = claim_now(&["text/plain;charset=utf-8", "text/html", "STRING"]);
+        assert!(claim.is_echo(&mimes(&["text/html"])));
+    }
+
+    /// A real copy adding a type we never advertised is not our echo.
+    #[test]
+    fn superset_offer_is_a_real_copy() {
+        let claim = claim_now(&["image/png"]);
+        assert!(!claim.is_echo(&mimes(&["image/png", "text/uri-list"])));
+    }
+
+    /// Past the window an identical offer is a genuine re-copy: a human
+    /// copying the same content again must still bridge.
+    #[test]
+    fn identical_offer_after_the_window_is_a_real_copy() {
+        let claim = OwnX11Claim {
+            at: Instant::now()
+                .checked_sub(MIRROR_ECHO_WINDOW + Duration::from_millis(1))
+                .expect("clock far enough past boot to predate the echo window"),
+            mime_types: mimes(&["image/png"]),
+        };
+        assert!(!claim.is_echo(&mimes(&["image/png"])));
+    }
+
+    /// An empty offer must never match — otherwise a claim with no types
+    /// would swallow arbitrary selection changes.
+    #[test]
+    fn empty_offer_is_never_an_echo() {
+        assert!(!claim_now(&["image/png"]).is_echo(&[]));
+    }
 }

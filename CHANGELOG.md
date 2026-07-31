@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Copies made while an X11 app holds the display no longer need to be
+  made twice before they can be pasted. When the backstop filled the
+  X11 gap, the Xwayland WM mirrored that proxy claim straight back as a
+  Wayland offer (~0.3 ms later); clipferry read it as a fresh copy and
+  destroyed the offer it was proxying, cancelling the real source — so
+  the whole chain, including a paste already streaming, dead-ended on
+  nothing. Our own claim is now recognised by identity and observed
+  rather than bridged (`event=coexist action=observe-own-claim`).
+- A Wayland source that goes away mid-transfer is refused instead of
+  being served as a successful empty payload: requestors were caching
+  that emptiness as the clipboard contents rather than retrying or
+  falling back to another target (`event=paste reason=empty-source`).
+
 ## [0.0.2] - 2026-07-06
 
 ### Added
