@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-09-15
+
 ### Changed
 
 - W→X claims capture the payload before taking the X11 selection, so
@@ -92,3 +94,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of pinning the transfer gate.
 - `x-special/gnome-copied-files`-only Wayland offers synthesize
   `text/uri-list` for X11 (cut/copy header handled both directions).
+
+[0.0.3]: https://github.com/jmylchreest/clipferry/compare/v0.0.2...v0.0.3
