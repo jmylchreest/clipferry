@@ -27,7 +27,7 @@ No config file, ever — a bare `clipferry` does the right thing. Continuous bui
 
 Compositors that outsource X11 to [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite) ([niri](https://github.com/YaLTeR/niri) being the flagship case) have incomplete clipboard integration — most visibly, copying out of X11 apps (games, Wine) doesn't reach the Wayland clipboard. clipferry is a single event-driven daemon that fills those gaps at the protocol level:
 
-- **Lazy** — payload bytes move only when someone pastes. A 50 MB screenshot copy costs a MIME-list exchange, not two transfers.
+- **Lazy** — payload bytes move only when someone pastes. A 50 MB screenshot copy costs a MIME-list exchange, not two transfers. (One exception, forced by satellite: taking the X11 selection makes satellite republish that claim onto the Wayland clipboard, which cancels the source we were proxying — so Wayland→X11 claims capture the payload first. In backstop mode we rarely claim at all, so this rarely costs anything.)
 - **All MIME types** — images, HTML, `text/uri-list`, arbitrary types, plus a small translation table for X11-isms (`x-special/gnome-copied-files`, WeChat/Wine quirks) and INCR in both directions.
 - **Loop prevention by ownership identity** — no content hashing, no sleeps, no races.
 - **Sandboxed & private** — self-applied [Landlock](https://landlock.io/) (no filesystem, no TCP) plus systemd hardening; content is never logged; payload buffers are zeroed at end-of-life.

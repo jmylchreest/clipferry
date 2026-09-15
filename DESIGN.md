@@ -108,6 +108,26 @@ Eager mode's snapshot is held in memory only, replaced on the next claim, and ne
 
 The broker treats this as a per-claim strategy decision, so the state machine is identical in both modes; only the "where do reads come from" arm differs. Implement lazy first (M1–M3), add eager in M4 — the snapshot path reuses the same transfer code with a memory sink instead of a paste fd.
 
+### 4.2.2 W→X claims capture first, always (field-derived, 2026-08-17)
+
+Lazy proxying assumes the source we proxy stays alive until someone pastes. In the W→X direction that assumption does not survive contact with an Xwayland bridge that *also* syncs X→W — which xwayland-satellite ≥ 0.8 does:
+
+1. A Wayland app copies. Nothing bridges it to X11, so we backstop-claim the X11 selection (§10.1).
+2. The bridge sees the X11 selection change and republishes it onto the **Wayland** clipboard as its own mirror, ~0.3 ms later.
+3. That republish is a selection change like any other, so the compositor cancels the source we are proxying. `wl-copy` exits. The screenshot is gone.
+4. An X11 client pastes. We read our offer and get EOF with zero bytes — `reason=empty-source`. The content is unrecoverable: the bridge's mirror reads from the X11 owner, which is us, which has nothing.
+
+The user-visible shape of this is "the first screenshot never pastes, the second one does" — the second copy works because by then the bridge owns the X11 selection and we stand down.
+
+There is no way to claim the X11 selection without provoking the mirror, so the claim must not depend on the source outliving it. **On every W→X claim, `receive()` every bridgeable type and flush *before* `SetSelectionOwner`.** Ordering is the entire mechanism: issuing the receives first puts the `send` events in the source client's queue ahead of any cancellation, so the bytes are already in flight when the mirror lands. Doing it after the claim — which is what `--sync-mode eager` did — is a race, and it loses.
+
+Consequences, all of them deliberate:
+
+- **W→X claims are never lazy.** §4.2's "a 50 MB screenshot costs a MIME-list exchange" still holds for X→W, and it holds for W→X copies we never claim — which, in backstop mode, is most of them. We pay one transfer exactly when the alternative was losing the content.
+- **Pastes that arrive mid-capture are parked, not refused.** The capture is the only place the bytes will be, so a `SelectionRequest` landing before it completes is held and replayed when the snapshot arrives (bounded by the same 2 s zero-progress rule as any transfer, so an answer always comes). Requests whose claim was superseded meanwhile are refused rather than answered with stale bytes.
+- **The Wayland source going away no longer releases the claim.** In the W→X direction that event is the *expected* consequence of our own claim, not a clear — §4.2.1a's survival rule therefore applies in lazy mode too, not just eager.
+- **`--eager-max-size` bounds the capture.** Over-cap types are dropped and logged at WARN (not DEBUG): on this path "degrade to lazy" means "lose the type" once the bridge cancels the source.
+
 ### 4.3 Loop prevention by identity
 
 Because clipferry is a *single process owning both proxy ends*, self-triggered events are identifiable by construction:
@@ -116,6 +136,13 @@ Because clipferry is a *single process owning both proxy ends*, self-triggered e
 - Wayland side: data-control emits our own source back; track the currently-claimed source object identity → ours, skip.
 
 No hashing, no sleeps, no races on identical content. An epoch counter (u64, incremented per legitimate claim) guards against late-arriving events from a superseded state.
+
+**The third self-triggered event: our own W→X claim, mirrored back.** A bridge that syncs X→W republishes our fresh X11 claim onto the Wayland clipboard within a millisecond (§4.2.2), and data-control gives us no client identity to reject it with. Two signals settle it, and both are needed:
+
+- **Fingerprint.** The mirror is built from our X11 `TARGETS` list and carries protocol machinery no Wayland application would ever offer. *Which* atoms survive is bridge-specific — xwayland-satellite drops `TARGETS` and keeps `TIMESTAMP` — so any one of `PROTOCOL_TARGETS` is the tell. Requiring a specific pair (`TARGETS` **and** `TIMESTAMP`) matched none of satellite's mirrors, and each one then read as a fresh Wayland copy.
+- **Content subset.** Compare *content* types only, with protocol atoms filtered out of both lists. Raw-list comparison makes the mirror a superset of what we advertised (`["image/png"]` comes back as `["image/png", "TIMESTAMP"]`), not the strict subset it looks like on paper.
+
+A fingerprinted mirror is identified by what it is, so no timing window applies to it. An unfingerprinted one falls back to a deliberately tight window (10 ms, ~30× the observed 0.3 ms): too wide and a genuine second copy landing that soon after its predecessor is silently swallowed, which loses real content; too narrow and an occasional mirror falls through to the pre-existing behaviour. Only the first is a regression.
 
 ### 4.4 One event loop
 

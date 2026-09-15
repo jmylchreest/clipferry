@@ -104,6 +104,26 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
     let device = manager.get_data_device(&seat, &qh);
     let mut app = App::new(x, wl_conn.clone(), manager, device, qh, options);
 
+    // The loop, its timers and the snapshot channel come up before the
+    // startup roundtrip: that roundtrip can itself produce a claim, and a
+    // claim without a capture channel (§4.2.2) is a claim whose payload can
+    // be cancelled out from under it.
+    let mut event_loop = EventLoop::<App>::try_new().context("create event loop")?;
+    app.loop_signal = Some(event_loop.get_signal());
+    app.loop_handle = Some(event_loop.handle());
+
+    // Snapshots and captures land back on the loop through this channel.
+    let (snapshot_tx, snapshot_rx) = calloop::channel::channel();
+    app.snapshot_tx = Some(snapshot_tx);
+    event_loop
+        .handle()
+        .insert_source(snapshot_rx, |msg, (), app: &mut App| {
+            if let calloop::channel::Event::Msg(msg) = msg {
+                app.on_snapshot(msg);
+            }
+        })
+        .map_err(|e| anyhow!("insert snapshot channel: {e}"))?;
+
     // Startup rule (§4.1): the roundtrip delivers the current Wayland
     // selection (if any); the probe fills the Wayland side if only X11 has
     // an owner. Both sides owned → touch nothing.
@@ -115,22 +135,6 @@ fn run(options: &cli::Options) -> anyhow::Result<()> {
         .roundtrip(&mut app)
         .context("initial Wayland roundtrip")?;
     app.probe_x11_startup();
-
-    let mut event_loop = EventLoop::<App>::try_new().context("create event loop")?;
-    app.loop_signal = Some(event_loop.get_signal());
-    app.loop_handle = Some(event_loop.handle());
-
-    // Eager snapshots (§4.2.1) land back on the loop through this channel.
-    let (snapshot_tx, snapshot_rx) = calloop::channel::channel();
-    app.snapshot_tx = Some(snapshot_tx);
-    event_loop
-        .handle()
-        .insert_source(snapshot_rx, |msg, (), app: &mut App| {
-            if let calloop::channel::Event::Msg(msg) = msg {
-                app.on_snapshot(msg);
-            }
-        })
-        .map_err(|e| anyhow!("insert snapshot channel: {e}"))?;
 
     WaylandSource::new(wl_conn, event_queue)
         .insert(event_loop.handle())
