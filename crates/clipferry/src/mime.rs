@@ -64,14 +64,28 @@ pub fn is_sensitive(types: &[String]) -> bool {
     types.iter().any(|t| t == KDE_PASSWORD_HINT)
 }
 
-/// Detect Xwayland-bridge mirror offers (telemetry only, §10.1).
+/// The content types of an offer: everything that is not X11 protocol
+/// machinery. Only these are meaningful to compare between an X11 target list
+/// and a Wayland offer.
+pub fn content_types(mime_types: &[String]) -> Vec<&String> {
+    mime_types
+        .iter()
+        .filter(|t| !PROTOCOL_TARGETS.contains(&t.as_str()))
+        .collect()
+}
+
+/// Detect Xwayland-bridge mirror offers (§10.1).
 ///
-/// Xwayland's builtin selection bridge mirrors X11 `TARGETS` verbatim as
-/// Wayland MIME strings — including protocol atoms no real application
-/// would offer. Logged for diagnosis; behavior is governed by the
-/// ownership-anchored bridge guard, not by this fingerprint.
+/// Xwayland's builtin selection bridge mirrors an X11 `TARGETS` list into
+/// Wayland MIME strings near-verbatim, carrying protocol atoms no real
+/// application would ever offer. *Which* atoms survive is bridge-specific —
+/// xwayland-satellite drops `TARGETS` but keeps `TIMESTAMP` — so any one of
+/// them is the fingerprint. Requiring a particular pair missed satellite's
+/// mirrors entirely, which then read as fresh Wayland copies.
 pub fn is_x11_mirror(mime_types: &[String]) -> bool {
-    mime_types.iter().any(|t| t == "TARGETS") && mime_types.iter().any(|t| t == "TIMESTAMP")
+    mime_types
+        .iter()
+        .any(|t| PROTOCOL_TARGETS.contains(&t.as_str()))
 }
 
 /// Streamable content transform for the §7 translation rows. Both variants
@@ -264,11 +278,24 @@ mod tests {
             "TIMESTAMP",
             "UTF8_STRING"
         ])));
+        // xwayland-satellite's actual shape: `TARGETS` filtered out,
+        // `TIMESTAMP` left in. Demanding both missed every one of these.
+        assert!(is_x11_mirror(&owned(&["image/png", "TIMESTAMP"])));
+        assert!(is_x11_mirror(&owned(&["TARGETS"])));
         assert!(!is_x11_mirror(&owned(&[
             "text/plain;charset=utf-8",
             "image/png"
         ])));
-        assert!(!is_x11_mirror(&owned(&["TARGETS"])));
+        // Legacy text atom names are content, not machinery.
+        assert!(!is_x11_mirror(&owned(&["UTF8_STRING", "STRING", "TEXT"])));
+        assert!(!is_x11_mirror(&[]));
+    }
+
+    #[test]
+    fn content_types_drops_protocol_machinery() {
+        let types = owned(&["TIMESTAMP", "image/png", "TARGETS", "text/html"]);
+        assert_eq!(content_types(&types), vec!["image/png", "text/html"]);
+        assert!(content_types(&owned(&["TARGETS", "TIMESTAMP"])).is_empty());
     }
 
     #[test]

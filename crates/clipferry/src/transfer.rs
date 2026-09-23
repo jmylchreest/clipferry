@@ -192,6 +192,20 @@ fn serve_w2x(
     let max_payload = conn.maximum_request_bytes().saturating_sub(1024);
 
     match PayloadRope::read_to_end(reader, Some(max_payload)).context("read from Wayland source")? {
+        ReadOutcome::Complete(rope) if rope.is_empty() => {
+            // EOF with no bytes means the Wayland source went away between
+            // `receive()` and the first read — a selection replaced under us,
+            // never a real payload. Answering with an empty property would
+            // report success, and the requestor would cache that emptiness as
+            // the clipboard contents; refuse so it can retry or fall back.
+            warn!(
+                "event=paste dir=w2x sel={} mime={:?} reason=empty-source",
+                reply.kind.key(),
+                reply.mime
+            );
+            notify(conn, &reply.req, None);
+            conn.flush()?;
+        }
         ReadOutcome::Complete(rope) => {
             let data = rope.to_contiguous();
             let data = match reply.conversion {
