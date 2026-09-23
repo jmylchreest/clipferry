@@ -4,11 +4,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use calloop::{LoopHandle, LoopSignal};
-use log::{debug, error, info};
+use log::{debug, error, info, trace, warn};
 use wayland_client::QueueHandle;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
@@ -34,6 +34,18 @@ const PRIMARY_DEBOUNCE: Duration = Duration::from_millis(50);
 /// see at most one ownership change per copy.
 const GAP_WINDOW: Duration = Duration::from_millis(200);
 
+/// §4.3 (W-side): how long after our own W→X proxy claim an incoming Wayland
+/// offer may still be that claim mirrored back by the Xwayland WM, *when the
+/// offer carries no X11 protocol fingerprint* to identify it outright. The
+/// mirror is a direct causal consequence of the claim and lands in well under
+/// a millisecond (~0.3 ms observed), so this is deliberately tight rather than
+/// generous. The two failure modes are not symmetric: too wide and a genuine
+/// second copy landing in `[claim, claim + window]` — i.e. `GAP_WINDOW` after
+/// its predecessor — is silently swallowed, losing real content; too narrow
+/// and an occasional mirror slips through to the pre-existing behaviour. Only
+/// the first is a regression, so prefer the margin here (~30× observed).
+const MIRROR_ECHO_WINDOW: Duration = Duration::from_millis(10);
+
 /// Per-selection state: broker plus everything a proxy claim carries.
 #[derive(Default)]
 struct SelCtx {
@@ -43,6 +55,10 @@ struct SelCtx {
     /// Wayland-side loop rule: while this is alive, any selection event is
     /// our own claim echoing back (a real takeover cancels the source first).
     our_source: Option<Source>,
+    /// Our own W→X proxy claim. Identity anchor for the §4.3 rule's other
+    /// half: the Xwayland WM mirrors that claim straight back as a Wayland
+    /// offer, which is otherwise indistinguishable from a fresh copy.
+    our_x11_claim: Option<OwnX11Claim>,
     /// W→X: atom → (source MIME to read, transform) for advertised targets.
     proxy_targets: HashMap<Atom, (String, Transform)>,
     /// X→W: advertised MIME → (x11 target, transform) read-plan overrides.
@@ -61,6 +77,52 @@ struct SelCtx {
     sensitive: bool,
     /// §4.2.1 eager snapshot for the current claim.
     snapshot: Option<Arc<Snapshot>>,
+    /// §4.2.2: broker epoch whose W→X capture is still in flight.
+    capture_epoch: Option<u64>,
+    /// W→X pastes held until that capture lands.
+    parked: Vec<ParkedPaste>,
+}
+
+/// A W→X paste that arrived while the §4.2.2 capture for its claim was still
+/// in flight. Everything `start_paste` needs, plus the epoch it belongs to —
+/// a capture superseded before it lands can only answer with stale bytes.
+struct ParkedPaste {
+    epoch: u64,
+    req: SelectionRequestEvent,
+    property: Atom,
+    mime: String,
+    reply_type: Atom,
+    conversion: Conv,
+    transform: Transform,
+}
+
+/// A proxy claim we made on the X11 side, kept just long enough to recognise
+/// the Xwayland WM mirroring it back onto the Wayland clipboard.
+struct OwnX11Claim {
+    at: Instant,
+    mime_types: Vec<String>,
+}
+
+impl OwnX11Claim {
+    /// True when an offer carrying `mime_types` can only be this claim coming
+    /// back at us: it advertises no *content* type we did not ourselves
+    /// advertise, and it is identifiable as a mirror — either by fingerprint
+    /// (it re-exports X11 protocol machinery, which no Wayland application
+    /// offers) or, failing that, by landing inside `MIRROR_ECHO_WINDOW`.
+    ///
+    /// Protocol targets are compared out rather than required to be absent:
+    /// xwayland-satellite re-publishes our X11 `TARGETS` list verbatim except
+    /// for `TARGETS` itself, so the mirror of an `image/png` claim comes back
+    /// as `["image/png", "TIMESTAMP"]` — a *superset* of what we advertised,
+    /// not the strict subset a naive reading suggests.
+    fn is_echo(&self, mime_types: &[String]) -> bool {
+        let content = mime::content_types(mime_types);
+        !content.is_empty()
+            && content
+                .iter()
+                .all(|m| self.mime_types.iter().any(|c| c == *m))
+            && (mime::is_x11_mirror(mime_types) || self.at.elapsed() <= MIRROR_ECHO_WINDOW)
+    }
 }
 
 /// §10.1 backstop: a copy happened on one side; fill the other side at
@@ -165,6 +227,35 @@ impl App {
         self.process_wayland_selection(kind, offer);
     }
 
+    /// List an incoming offer's types alongside our own live claim — the two
+    /// lists are what every mirror-versus-copy question turns on. §8: types
+    /// stay out of the log entirely for sensitive offers.
+    fn trace_offer_types(&self, kind: SelKind, mime_types: &[String]) {
+        if mime::is_sensitive(mime_types) {
+            trace!(
+                "event=offer_types side=wayland sel={} sensitive=true",
+                kind.key()
+            );
+            return;
+        }
+        let claim = self.ctx[kind.idx()].our_x11_claim.as_ref();
+        trace!(
+            "event=offer_types side=wayland sel={} mimes={mime_types:?} own_claim={:?} claim_age_ms={:?}",
+            kind.key(),
+            claim.map(|c| &c.mime_types),
+            claim.map(|c| c.at.elapsed().as_millis()),
+        );
+    }
+
+    /// True when this offer is the Xwayland WM mirroring the proxy claim we
+    /// just made for the very same content.
+    fn is_own_claim_echo(&self, kind: SelKind, mime_types: &[String]) -> bool {
+        self.ctx[kind.idx()]
+            .our_x11_claim
+            .as_ref()
+            .is_some_and(|claim| claim.is_echo(mime_types))
+    }
+
     pub fn on_wayland_primary(&mut self, offer: Option<Offer>) {
         if self.primary {
             self.on_wayland_selection(SelKind::Primary, offer);
@@ -174,6 +265,24 @@ impl App {
     }
 
     fn process_wayland_selection(&mut self, kind: SelKind, offer: Option<Offer>) {
+        if let Some(o) = &offer {
+            self.trace_offer_types(kind, &o.mime_types());
+        }
+        // §4.3: the Xwayland WM re-publishing our own proxy claim is not a
+        // copy. Falling through would destroy `current_offer` below — the
+        // live source the mirror itself ultimately reads through — leaving
+        // the whole chain dead-ended on a cancelled source, so every paste
+        // (including one already streaming) yields nothing.
+        if let Some(o) = &offer
+            && self.is_own_claim_echo(kind, &o.mime_types())
+        {
+            debug!(
+                "event=coexist side=wayland sel={} action=observe-own-claim",
+                kind.key()
+            );
+            o.destroy();
+            return;
+        }
         if let Some(old) = self.ctx[kind.idx()].current_offer.take() {
             old.destroy();
         }
@@ -471,20 +580,22 @@ impl App {
         Ok(())
     }
 
-    /// Eager survival (§4.2.1a): when the source app exits while we hold a
-    /// snapshot for this claim, keep the opposite-side proxy claim alive and
-    /// serve from memory instead of tearing everything down.
+    /// Eager survival (§4.2.1a): when the source app exits while we hold —
+    /// or are still pulling — its content, keep the opposite-side proxy claim
+    /// alive and serve from memory instead of tearing everything down.
     fn survives_source_exit(&self, kind: SelKind, source_state_is_x11: bool) -> bool {
-        if self.sync_mode != SyncMode::Eager {
-            return false;
-        }
         let ctx = &self.ctx[kind.idx()];
-        if ctx.snapshot.is_none() {
-            return false;
-        }
         match ctx.broker.state() {
-            broker::State::X11App { .. } => source_state_is_x11,
-            broker::State::WaylandApp { .. } => !source_state_is_x11,
+            // W→X (§4.2.2): the source going away is the *expected* outcome
+            // of our own claim under a mirroring Xwayland bridge, not a
+            // reason to release. The capture is what the claim rests on, so
+            // this holds in lazy mode too.
+            broker::State::WaylandApp { .. } if !source_state_is_x11 => {
+                ctx.capture_epoch.is_some() || ctx.snapshot.is_some()
+            }
+            broker::State::X11App { .. } if source_state_is_x11 => {
+                self.sync_mode == SyncMode::Eager && ctx.snapshot.is_some()
+            }
             _ => false,
         }
     }
@@ -505,6 +616,7 @@ impl App {
                 if let Some(kind) = self.kind_for_selection(e.selection) {
                     info!("event=lost side=x11 sel={}", kind.key());
                     self.x11.owned_since[kind.idx()] = None;
+                    self.ctx[kind.idx()].our_x11_claim = None;
                     self.dispatch_broker(kind, broker::Event::X11Lost);
                 }
             }
@@ -787,6 +899,29 @@ impl App {
         conversion: Conv,
         transform: Transform,
     ) {
+        // §4.2.2: a capture for this claim is still in flight. The Wayland
+        // source may already be cancelled, so the snapshot is the only place
+        // the bytes will ever be — park the request rather than race it into
+        // an `empty-source` refusal. `collect_snapshot`'s zero-progress bound
+        // means the answer always arrives.
+        let ctx = &self.ctx[kind.idx()];
+        if ctx.capture_epoch.is_some_and(|e| e == ctx.broker.epoch()) {
+            debug!(
+                "event=park dir=w2x sel={} mime={mime:?} reason=capture-in-flight",
+                kind.key()
+            );
+            let epoch = ctx.broker.epoch();
+            self.ctx[kind.idx()].parked.push(ParkedPaste {
+                epoch,
+                req,
+                property,
+                mime,
+                reply_type,
+                conversion,
+                transform,
+            });
+            return;
+        }
         let reply = PasteReply {
             kind,
             mime: mime.clone(),
@@ -840,87 +975,179 @@ impl App {
 
     // --- Eager snapshots (§4.2.1) -------------------------------------------
 
-    /// Kick off an eager fetch of every bridgeable type for the current
-    /// claim. Data lands back on the event loop via the snapshot channel.
-    fn start_eager_fetch(&mut self, kind: SelKind, mimes: &[String]) {
+    /// §4.2.2 W→X capture: pull every bridgeable type out of the Wayland
+    /// source *before* the caller takes the X11 selection.
+    ///
+    /// An Xwayland bridge that also syncs X→W republishes our fresh X11 claim
+    /// onto the Wayland clipboard within a millisecond of us making it
+    /// (~0.3 ms observed with xwayland-satellite 0.8). That republish is a
+    /// selection change like any other, so the compositor cancels the source
+    /// we are proxying — `wl-copy` exits, and the screenshot is gone before
+    /// the first paste arrives. Lazy proxying (§4.2) cannot survive that: by
+    /// the time an X11 client asks, there is nothing left to read.
+    ///
+    /// Issuing `receive()` first puts the `send` events in the source's queue
+    /// ahead of any cancellation, so the bytes are already on their way.
+    /// Ordering is the whole point — doing this after the claim is a race we
+    /// lose. In backstop mode we only claim into genuine voids, so this costs
+    /// a transfer exactly when the alternative was losing the content.
+    fn start_w2x_capture(&mut self, kind: SelKind, mimes: &[String]) {
+        let Some(tx) = self.snapshot_tx.clone() else {
+            return; // no event loop yet (startup roundtrip) — nothing to park
+        };
+        let Some(offer) = self.ctx[kind.idx()].current_offer.clone() else {
+            return;
+        };
+        let epoch = self.ctx[kind.idx()].broker.epoch();
+        let (cap, timeout) = (self.eager_max, self.transfer_timeout);
+        let mut pipes = Vec::new();
+        for mime in mimes {
+            match std::io::pipe() {
+                Ok((reader, writer)) => {
+                    offer.receive(mime, std::os::fd::AsFd::as_fd(&writer));
+                    drop(writer);
+                    pipes.push((mime.clone(), reader));
+                }
+                Err(e) => error!("event=capture error={:?}", e.to_string()),
+            }
+        }
+        if pipes.is_empty() {
+            return;
+        }
+        if let Err(e) = self.wl_conn.flush() {
+            self.fatal(anyhow!(e).context("flush Wayland after capture receive"));
+            return;
+        }
+        debug!(
+            "event=capture dir=w2x sel={} types={} action=started",
+            kind.key(),
+            pipes.len()
+        );
+        self.ctx[kind.idx()].capture_epoch = Some(epoch);
+        std::thread::spawn(move || {
+            collect_snapshot(kind, epoch, pipes, cap, timeout, "w2x", &tx);
+        });
+    }
+
+    /// §4.2.1 X→W eager snapshot: read the X11 owner's targets now so the
+    /// content survives the owner exiting.
+    fn start_eager_fetch(&self, kind: SelKind, mimes: &[String]) {
         if self.sync_mode != SyncMode::Eager {
             return;
         }
         let Some(tx) = self.snapshot_tx.clone() else {
             return;
         };
+        if !matches!(
+            self.ctx[kind.idx()].broker.state(),
+            broker::State::X11App { .. }
+        ) {
+            return;
+        }
         let epoch = self.ctx[kind.idx()].broker.epoch();
-        let cap = self.eager_max;
-        let timeout = self.transfer_timeout;
-        match self.ctx[kind.idx()].broker.state() {
-            broker::State::WaylandApp { .. } => {
-                // W-side owner: receive() every type into pipes now, collect
-                // on a thread.
-                let Some(offer) = self.ctx[kind.idx()].current_offer.clone() else {
-                    return;
-                };
-                let mut pipes = Vec::new();
-                for mime in mimes {
-                    match std::io::pipe() {
-                        Ok((reader, writer)) => {
-                            offer.receive(mime, std::os::fd::AsFd::as_fd(&writer));
-                            drop(writer);
-                            pipes.push((mime.clone(), reader));
-                        }
-                        Err(e) => error!("event=snapshot error={:?}", e.to_string()),
-                    }
+        let (cap, timeout) = (self.eager_max, self.transfer_timeout);
+        // One lazy read per type into pipes, then collect. spawn_x11_read
+        // serializes via the X→W gate.
+        let mut pipes = Vec::new();
+        for mime in mimes {
+            match std::io::pipe() {
+                Ok((reader, writer)) => {
+                    let plan = self.ctx[kind.idx()].x2w_plans.get(mime).cloned();
+                    transfer::spawn_x11_read(X2wRequest {
+                        mime: mime.clone(),
+                        plan,
+                        kind,
+                        fd: writer.into(),
+                        timeout,
+                    });
+                    pipes.push((mime.clone(), reader));
                 }
-                if let Err(e) = self.wl_conn.flush() {
-                    self.fatal(anyhow!(e).context("flush Wayland after eager receive"));
-                    return;
-                }
-                std::thread::spawn(move || {
-                    collect_snapshot(kind, epoch, pipes, cap, timeout, &tx);
-                });
+                Err(e) => error!("event=snapshot error={:?}", e.to_string()),
             }
-            broker::State::X11App { .. } => {
-                // X-side owner: run one lazy read per type into pipes, then
-                // collect. spawn_x11_read serializes via the X→W gate.
-                let mut pipes = Vec::new();
-                for mime in mimes {
-                    match std::io::pipe() {
-                        Ok((reader, writer)) => {
-                            let plan = self.ctx[kind.idx()].x2w_plans.get(mime).cloned();
-                            transfer::spawn_x11_read(X2wRequest {
-                                mime: mime.clone(),
-                                plan,
-                                kind,
-                                fd: writer.into(),
-                                timeout,
-                            });
-                            pipes.push((mime.clone(), reader));
-                        }
-                        Err(e) => error!("event=snapshot error={:?}", e.to_string()),
-                    }
-                }
-                std::thread::spawn(move || {
-                    collect_snapshot(kind, epoch, pipes, cap, timeout, &tx);
-                });
+        }
+        std::thread::spawn(move || {
+            collect_snapshot(kind, epoch, pipes, cap, timeout, "x2w", &tx);
+        });
+    }
+
+    /// Snapshot fetch finished: adopt it if it still matches the epoch, then
+    /// answer anything parked on it either way — a superseded capture still
+    /// owes its requestors a reply (§4.2.2).
+    pub fn on_snapshot(&mut self, msg: SnapshotMsg) {
+        let kind = msg.kind;
+        let epoch = msg.snapshot.epoch;
+        let ctx = &mut self.ctx[kind.idx()];
+        if epoch == ctx.broker.epoch() {
+            if !msg.snapshot.lock_in_memory() {
+                debug!("event=mlock status=partial");
             }
-            _ => {}
+            let types = msg.snapshot.data.len();
+            ctx.snapshot = Some(Arc::new(msg.snapshot));
+            if ctx.sensitive {
+                info!("event=snapshot sel={} sensitive=true", kind.key());
+            } else {
+                debug!("event=snapshot sel={} types={types}", kind.key());
+            }
+        }
+        // Superseded claim: ropes zero on drop.
+        if ctx.capture_epoch == Some(epoch) {
+            ctx.capture_epoch = None;
+            self.flush_parked(kind);
         }
     }
 
-    /// Snapshot fetch finished: adopt it if it still matches the epoch.
-    pub fn on_snapshot(&mut self, msg: SnapshotMsg) {
-        let ctx = &mut self.ctx[msg.kind.idx()];
-        if msg.snapshot.epoch != ctx.broker.epoch() {
-            return; // superseded claim; ropes zero on drop
+    /// Replay the pastes held for a capture that has now landed. Requests
+    /// whose claim was superseded meanwhile can only be answered with stale
+    /// bytes, so they are refused instead (§6: a refusal lets the requestor
+    /// retry; an empty property would be cached as the clipboard contents).
+    fn flush_parked(&mut self, kind: SelKind) {
+        let parked = std::mem::take(&mut self.ctx[kind.idx()].parked);
+        if parked.is_empty() {
+            return;
         }
-        if !msg.snapshot.lock_in_memory() {
-            debug!("event=mlock status=partial");
+        let epoch = self.ctx[kind.idx()].broker.epoch();
+        debug!(
+            "event=unpark dir=w2x sel={} held={}",
+            kind.key(),
+            parked.len()
+        );
+        for p in parked {
+            if p.epoch != epoch {
+                debug!("event=refuse dir=w2x reason=superseded-capture");
+                transfer::notify(&self.x11.conn, &p.req, None);
+                continue;
+            }
+            self.start_paste(
+                kind,
+                p.req,
+                p.property,
+                p.mime,
+                p.reply_type,
+                p.conversion,
+                p.transform,
+            );
         }
-        let types = msg.snapshot.data.len();
-        ctx.snapshot = Some(Arc::new(msg.snapshot));
-        if ctx.sensitive {
-            info!("event=snapshot sel={} sensitive=true", msg.kind.key());
-        } else {
-            debug!("event=snapshot sel={} types={types}", msg.kind.key());
+        if let Err(e) = self.x11.conn.flush() {
+            self.fatal(anyhow!(e).context("flush X11 after unparking pastes"));
+        }
+    }
+
+    /// Refuse everything parked: whatever they were waiting for is gone.
+    fn discard_parked(&mut self, kind: SelKind) {
+        let parked = std::mem::take(&mut self.ctx[kind.idx()].parked);
+        if parked.is_empty() {
+            return;
+        }
+        debug!(
+            "event=refuse dir=w2x sel={} held={} reason=claim-gone",
+            kind.key(),
+            parked.len()
+        );
+        for p in parked {
+            transfer::notify(&self.x11.conn, &p.req, None);
+        }
+        if let Err(e) = self.x11.conn.flush() {
+            self.fatal(anyhow!(e).context("flush X11 after discarding pastes"));
         }
     }
 
@@ -931,62 +1158,82 @@ impl App {
         let commands = self.ctx[kind.idx()].broker.handle(event);
         if self.ctx[kind.idx()].broker.epoch() != before {
             // Every legitimate ownership change invalidates the snapshot;
-            // a fresh one arrives after the new claim (§4.2.1).
+            // a fresh one arrives after the new claim (§4.2.1). Anything
+            // parked on the old capture is owed a refusal before the
+            // commands below start a new one (§4.2.2).
             self.ctx[kind.idx()].snapshot = None;
+            self.ctx[kind.idx()].capture_epoch = None;
+            self.discard_parked(kind);
         }
         for command in commands {
             self.run_command(kind, &command);
         }
     }
 
-    fn run_command(&mut self, kind: SelKind, command: &Command) {
-        match command {
-            Command::ClaimX11 { .. } => {
-                let (map, mimes) = match self.ctx[kind.idx()].broker.state() {
-                    broker::State::WaylandApp { mime_types } => {
-                        let mut map = match self.x11.intern_mimes(mime_types) {
-                            Ok(map) => map
-                                .into_iter()
-                                .map(|(atom, mime)| (atom, (mime, Transform::None)))
-                                .collect::<HashMap<_, _>>(),
-                            Err(e) => {
-                                self.fatal(e.context("intern offer MIME atoms"));
-                                return;
-                            }
-                        };
-                        // §7 synthesized targets (gnome-copied-files).
-                        for (target, source_mime, transform) in
-                            mime::synthesized_x11_targets(mime_types)
-                        {
-                            match self.x11.intern_mimes(std::slice::from_ref(&target)) {
-                                Ok(extra) => {
-                                    for (atom, _) in extra {
-                                        map.insert(atom, (source_mime.clone(), transform));
-                                    }
-                                }
-                                Err(e) => {
-                                    self.fatal(e.context("intern synthesized target"));
-                                    return;
-                                }
-                            }
-                        }
-                        (map, mime_types.clone())
+    /// W→X: intern the offer's types as X11 targets, capture the payload,
+    /// then take the selection. Order matters — see `start_w2x_capture`.
+    fn claim_x11(&mut self, kind: SelKind) {
+        let (map, mimes) = match self.ctx[kind.idx()].broker.state() {
+            broker::State::WaylandApp { mime_types } => {
+                let mut map = match self.x11.intern_mimes(mime_types) {
+                    Ok(map) => map
+                        .into_iter()
+                        .map(|(atom, mime)| (atom, (mime, Transform::None)))
+                        .collect::<HashMap<_, _>>(),
+                    Err(e) => {
+                        self.fatal(e.context("intern offer MIME atoms"));
+                        return;
                     }
-                    _ => (HashMap::new(), Vec::new()),
                 };
-                self.ctx[kind.idx()].proxy_targets = map;
-                match self.x11.claim(kind) {
-                    Ok(pending) => {
-                        for event in pending {
-                            self.handle_x11_event(&event);
+                // §7 synthesized targets (gnome-copied-files).
+                for (target, source_mime, transform) in mime::synthesized_x11_targets(mime_types) {
+                    match self.x11.intern_mimes(std::slice::from_ref(&target)) {
+                        Ok(extra) => {
+                            for (atom, _) in extra {
+                                map.insert(atom, (source_mime.clone(), transform));
+                            }
                         }
-                        self.start_eager_fetch(kind, &mimes);
+                        Err(e) => {
+                            self.fatal(e.context("intern synthesized target"));
+                            return;
+                        }
                     }
-                    Err(e) => self.fatal(e.context("claim X11 selection")),
+                }
+                (map, mime_types.clone())
+            }
+            _ => (HashMap::new(), Vec::new()),
+        };
+        self.ctx[kind.idx()].proxy_targets = map;
+        // §4.2.2: the bytes have to be on their way out of the Wayland source
+        // before the claim, because the claim is what kills it.
+        if !mimes.is_empty() {
+            self.start_w2x_capture(kind, &mimes);
+        }
+        match self.x11.claim(kind) {
+            Ok(pending) => {
+                // Only W→X proxy claims get mirrored back onto the Wayland
+                // clipboard; an empty list would make the subset test in
+                // `is_own_claim_echo` match anything.
+                self.ctx[kind.idx()].our_x11_claim = (!mimes.is_empty()).then(|| OwnX11Claim {
+                    at: Instant::now(),
+                    mime_types: mimes,
+                });
+                for event in pending {
+                    self.handle_x11_event(&event);
                 }
             }
+            Err(e) => self.fatal(e.context("claim X11 selection")),
+        }
+    }
+
+    fn run_command(&mut self, kind: SelKind, command: &Command) {
+        match command {
+            Command::ClaimX11 { .. } => self.claim_x11(kind),
             Command::ReleaseX11 => {
                 self.ctx[kind.idx()].proxy_targets.clear();
+                self.ctx[kind.idx()].our_x11_claim = None;
+                self.ctx[kind.idx()].capture_epoch = None;
+                self.discard_parked(kind);
                 if let Err(e) = self.x11.release(kind) {
                     self.fatal(e.context("release X11 selection"));
                 }
@@ -1049,15 +1296,17 @@ impl App {
     }
 }
 
-/// Read each eager pipe to EOF (bounded by `cap` per type) and deliver the
-/// snapshot back to the event loop. Over-cap or failed types are skipped —
-/// they degrade to lazy (§4.2.1).
+/// Read each pipe to EOF (bounded by `cap` per type) and deliver the snapshot
+/// back to the event loop. Over-cap or failed types are skipped — they degrade
+/// to lazy (§4.2.1), which on the W→X capture path (§4.2.2) means the type is
+/// lost outright once the bridge cancels the source, so say so out loud there.
 fn collect_snapshot(
     kind: SelKind,
     epoch: u64,
     pipes: Vec<(String, std::io::PipeReader)>,
     cap: Option<usize>,
     timeout: Option<Duration>,
+    dir: &'static str,
     tx: &calloop::channel::Sender<SnapshotMsg>,
 ) {
     let mut data = HashMap::new();
@@ -1071,14 +1320,20 @@ fn collect_snapshot(
                     data.insert(mime, rope);
                 }
             }
+            Ok(ReadOutcome::Overflow(_)) if dir == "w2x" => {
+                warn!(
+                    "event=snapshot_skip dir={dir} sel={} mime={mime:?} reason=over-cap",
+                    kind.key()
+                );
+            }
             Ok(ReadOutcome::Overflow(_)) => {
                 debug!(
-                    "event=snapshot_skip sel={} mime={mime:?} reason=over-cap",
+                    "event=snapshot_skip dir={dir} sel={} mime={mime:?} reason=over-cap",
                     kind.key()
                 );
             }
             Err(e) => debug!(
-                "event=snapshot_skip sel={} mime={mime:?} error={:?}",
+                "event=snapshot_skip dir={dir} sel={} mime={mime:?} error={:?}",
                 kind.key(),
                 e.to_string()
             ),
@@ -1088,4 +1343,100 @@ fn collect_snapshot(
         kind,
         snapshot: Snapshot { epoch, data },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mimes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn claim_now(list: &[&str]) -> OwnX11Claim {
+        OwnX11Claim {
+            at: Instant::now(),
+            mime_types: mimes(list),
+        }
+    }
+
+    /// An instant far enough back that `MIRROR_ECHO_WINDOW` has expired.
+    fn aged_out() -> Instant {
+        Instant::now()
+            .checked_sub(MIRROR_ECHO_WINDOW + Duration::from_millis(1))
+            .expect("clock far enough past boot to predate the echo window")
+    }
+
+    /// The niri-screenshot regression: we backstop-claim X11 for an
+    /// `image/png` offer and Xwayland republishes it onto Wayland ~0.3 ms
+    /// later. Mistaking that for a copy destroys the live offer and every
+    /// subsequent paste reads a cancelled source.
+    #[test]
+    fn own_claim_mirrored_back_is_an_echo() {
+        assert!(claim_now(&["image/png"]).is_echo(&mimes(&["image/png"])));
+    }
+
+    /// Translation drops protocol targets, so the mirror usually comes back
+    /// as a strict subset of what we advertised.
+    #[test]
+    fn echo_may_be_a_subset_of_the_claim() {
+        let claim = claim_now(&["text/plain;charset=utf-8", "text/html", "STRING"]);
+        assert!(claim.is_echo(&mimes(&["text/html"])));
+    }
+
+    /// What xwayland-satellite actually mirrors back: our advertised types
+    /// *plus* `TIMESTAMP` from the X11 `TARGETS` list. Comparing the raw
+    /// lists makes that a superset and the echo goes unrecognised — the
+    /// live offer is destroyed and the paste comes back empty (the
+    /// two-screenshots-to-copy report).
+    #[test]
+    fn satellite_mirror_re_exports_timestamp() {
+        assert!(claim_now(&["image/png"]).is_echo(&mimes(&["image/png", "TIMESTAMP"])));
+        let claim = claim_now(&["text/plain;charset=utf-8", "STRING", "text/plain"]);
+        assert!(claim.is_echo(&mimes(&["TIMESTAMP", "STRING", "text/plain"])));
+    }
+
+    /// A protocol-fingerprinted mirror is identified by what it is, not when
+    /// it arrived: no Wayland application advertises `TIMESTAMP`, so the
+    /// timing window is irrelevant for it.
+    #[test]
+    fn fingerprinted_mirror_is_an_echo_past_the_window() {
+        let claim = OwnX11Claim {
+            at: aged_out(),
+            mime_types: mimes(&["image/png"]),
+        };
+        assert!(claim.is_echo(&mimes(&["image/png", "TIMESTAMP"])));
+    }
+
+    /// A mirror carrying nothing but protocol machinery has no content to
+    /// match against — never let it swallow a selection change.
+    #[test]
+    fn protocol_only_offer_is_never_an_echo() {
+        assert!(!claim_now(&["image/png"]).is_echo(&mimes(&["TARGETS", "TIMESTAMP"])));
+    }
+
+    /// A real copy adding a type we never advertised is not our echo.
+    #[test]
+    fn superset_offer_is_a_real_copy() {
+        let claim = claim_now(&["image/png"]);
+        assert!(!claim.is_echo(&mimes(&["image/png", "text/uri-list"])));
+    }
+
+    /// Past the window an identical, unfingerprinted offer is a genuine
+    /// re-copy: a human copying the same content again must still bridge.
+    #[test]
+    fn identical_offer_after_the_window_is_a_real_copy() {
+        let claim = OwnX11Claim {
+            at: aged_out(),
+            mime_types: mimes(&["image/png"]),
+        };
+        assert!(!claim.is_echo(&mimes(&["image/png"])));
+    }
+
+    /// An empty offer must never match — otherwise a claim with no types
+    /// would swallow arbitrary selection changes.
+    #[test]
+    fn empty_offer_is_never_an_echo() {
+        assert!(!claim_now(&["image/png"]).is_echo(&[]));
+    }
 }
