@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-09-15
+
+### Changed
+
+- W→X claims capture the payload before taking the X11 selection, so
+  they no longer depend on the Wayland source outliving the claim.
+  Bytes still move only on paste for X→W, and for the W→X copies the
+  backstop never claims — which is most of them — but a claim we do
+  make now costs one transfer. `--eager-max-size` bounds the capture;
+  over-cap types are dropped and logged at WARN, since here "degrade to
+  lazy" means the type is lost. Pastes arriving mid-capture are held
+  and replayed rather than refused (`event=park` / `event=unpark`).
+
 ### Fixed
 
+- Screenshots (and any other Wayland copy) no longer need to be made
+  twice before an X11 or Xwayland app can paste them. Two defects, both
+  triggered by the same 0.3 ms echo:
+  - Taking the X11 selection makes xwayland-satellite republish that
+    claim onto the Wayland clipboard, which cancels the source being
+    proxied — `wl-copy` exits and the content is gone before the first
+    paste arrives (`event=paste reason=empty-source`). Lazy proxying
+    cannot survive that, so the W→X path now captures first (above).
+  - That republished claim was not recognised as our own: satellite
+    re-exports our X11 `TARGETS` list minus `TARGETS` itself, so the
+    mirror comes back carrying `TIMESTAMP` — a *superset* of what we
+    advertised, which failed the subset test. Content types are now
+    compared with X11 protocol atoms filtered out of both sides, and
+    any such atom fingerprints the offer as a bridge mirror outright
+    (`event=coexist action=observe-own-claim`). The mirror fingerprint
+    likewise no longer demands both `TARGETS` and `TIMESTAMP`, which
+    satellite's mirrors never satisfy.
 - Copies made while an X11 app holds the display no longer need to be
   made twice before they can be pasted. When the backstop filled the
   X11 gap, the Xwayland WM mirrored that proxy claim straight back as a
@@ -64,3 +94,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of pinning the transfer gate.
 - `x-special/gnome-copied-files`-only Wayland offers synthesize
   `text/uri-list` for X11 (cut/copy header handled both directions).
+
+[0.0.3]: https://github.com/jmylchreest/clipferry/compare/v0.0.2...v0.0.3
