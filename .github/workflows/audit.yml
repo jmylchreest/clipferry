@@ -1,20 +1,37 @@
 name: Security audit
+run-name: ${{ inputs.fallback_of && format('fallback:{0}', inputs.fallback_of) || github.workflow }}
 
 on:
   schedule:
     - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
   workflow_dispatch:
+    inputs:
+      backend:
+        description: Runner backend
+        type: choice
+        options: [hosted, arc]
+        default: hosted
+      source_sha:
+        description: Exact source commit supplied by the fallback router
+        type: string
+      fallback_of:
+        description: Parent run ID supplied by the fallback router
+        type: string
 
 permissions: {}
 
 jobs:
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.source_sha || inputs.source_sha == github.workflow_sha }}
+    runs-on: ${{ github.event_name != 'pull_request' && inputs.backend == 'arc' && 'clipferry-linux' || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
       - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-audit
