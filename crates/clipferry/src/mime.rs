@@ -217,8 +217,11 @@ mod tests {
             )]
         );
         // Already offered → nothing to synthesize.
-        assert!(synthesized_x11_targets(&owned(&["text/uri-list", GNOME_COPIED_FILES])).is_empty());
-        assert!(synthesized_x11_targets(&owned(&["image/png"])).is_empty());
+        assert_eq!(
+            synthesized_x11_targets(&owned(&["text/uri-list", GNOME_COPIED_FILES])),
+            []
+        );
+        assert_eq!(synthesized_x11_targets(&owned(&["image/png"])), []);
     }
 
     #[test]
@@ -239,7 +242,7 @@ mod tests {
         let (adv, plans) =
             x2w_translate(&owned(&["TARGETS", "TIMESTAMP", "UTF8_STRING", "STRING"]));
         assert_eq!(adv, owned(X2W_TEXT_MIMES));
-        assert!(plans.is_empty());
+        assert_eq!(plans, []);
     }
 
     #[test]
@@ -256,7 +259,7 @@ mod tests {
         );
         // Owner already offers uri-list: no synthesis needed.
         let (adv, plans) = x2w_translate(&owned(&[GNOME_COPIED_FILES, URI_LIST]));
-        assert!(plans.is_empty());
+        assert_eq!(plans, []);
         assert!(adv.contains(&URI_LIST.to_owned()));
         assert!(adv.contains(&GNOME_COPIED_FILES.to_owned()));
     }
@@ -295,7 +298,10 @@ mod tests {
     fn content_types_drops_protocol_machinery() {
         let types = owned(&["TIMESTAMP", "image/png", "TARGETS", "text/html"]);
         assert_eq!(content_types(&types), vec!["image/png", "text/html"]);
-        assert!(content_types(&owned(&["TARGETS", "TIMESTAMP"])).is_empty());
+        assert_eq!(
+            content_types(&owned(&["TARGETS", "TIMESTAMP"])),
+            [] as [&String; 0]
+        );
     }
 
     #[test]
